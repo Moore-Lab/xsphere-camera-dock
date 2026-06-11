@@ -1,0 +1,6 @@
+[submodule "basler-acA1440"]
+	path = basler-acA1440
+	url = https://github.com/Moore-Lab/basler-acA1440.git
+[submodule "zelux-cs165mu"]
+	path = zelux-cs165mu
+	url = https://github.com/Moore-Lab/zelux-cs165mu.git

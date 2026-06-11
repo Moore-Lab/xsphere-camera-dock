@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Captures / recordings (don't commit data)
+captures/
+recordings/
+*.tiff
+*.tif
+*.avi
+*.mp4
+*.raw
+*.npy
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
