@@ -35,4 +35,5 @@ git submodule update --init --recursive
 
 ## Status
 
-Scaffolding only — submodule structure in place, integration layer pending.
+Scaffolding only — submodule structure in place, integration layer pending. Development
+is tracked in [`docs/session-log.md`](docs/session-log.md).
