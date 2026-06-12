@@ -13,6 +13,33 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-06-12 — Dock web app: stream the camera feed (first web UI)
+
+**Context.** Start of the dock's web UI — "a webpage that streams the camera feed."
+
+- `camera_dock/webapp.py` — a FastAPI server that runs any `CameraBase` camera through
+  the shared `AcquisitionEngine` and streams it as **MJPEG** (a plain `<img>` tag).
+  Camera-agnostic: `create_app(camera)` works for Basler/Zelux/Hayear unchanged — the
+  same engine that backs the test GUIs now feeds the browser. Endpoints: `/` (HTML
+  page), `/stream` (multipart MJPEG), `/snapshot` (one JPEG), `/info` (JSON). Frames
+  carry the acq-fps/exposure overlay + the New Haven timestamp. Run:
+  `python -m camera_dock.webapp basler --host 0.0.0.0 --port 8000`.
+- `requirements.txt`: enabled `fastapi` + `uvicorn`.
+
+**Validated on hardware (Basler, headless server + curl):** `/info` →
+`acA1440-220um 1456x1088 @ 30.1 fps`; `/` serves the page; `/snapshot` → 33 KB JPEG
+(magic FFD8); `/stream` → 62 MJPEG frames in 3 s. Streams at ~30 fps to the browser
+while the engine runs the camera underneath (display rate decoupled from capture).
+
+**Hayear scaffold (separate, uncommitted).** Added `hayear/` (hycam/ToupCam driver +
+GUI shell) as an **unvalidated** local scaffold — imports cleanly, conforms to
+`CameraBase`, fails `connect()` with a clear "install hycam.py" message. Left untracked
+pending its own Moore-Lab repo; see memory `hayear-camera-support-pending`. TODO needs a
+connected camera + the hycam wrapper to validate (driver acquisition/no-drop/color).
+
+**Next:** grow the web UI — camera picker / multi-stream, and live controls
+(exposure/gain/ROI/record) over the engine, reusing the same `CameraBase` surface.
+
 ## 2026-06-12 — New Haven timestamp burned into preview + movie
 
 **Context.** Request: show the New Haven date/time in the window *and* have it recorded

@@ -2,6 +2,6 @@
 numpy
 opencv-python          # acquisition engine, recorder, preview GUI, imaging helpers
 tzdata                 # IANA tz database for zoneinfo (New Haven timestamps on Windows)
-# Web app / streaming layer (framework TBD during planning)
-# fastapi
-# uvicorn
+# Web app / streaming layer (camera_dock.webapp — MJPEG camera stream)
+fastapi
+uvicorn
