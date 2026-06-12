@@ -13,6 +13,35 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-06-12 — Stage 2 Round B: ROI / binning
+
+**Context.** The last Stage 2 feature — held back because it must stop acquisition to
+change the sensor region and is camera-specific.
+
+**`CameraBase`** gains optional ROI/binning: `roi_range` (dict: w/h min/max/inc + x/y
+inc), `set_roi(x,y,w,h)` / `get_roi` / `reset_roi`, `binning_range` /
+`set_binning(bx,by)` / `get_binning`. ROI is uniform across cameras as
+`(offset_x, offset_y, width, height)`; drivers translate (Zelux uses corner coords).
+
+**`preview.py`** wiring: `o` = draw a region with `cv2.selectROI` (selects on a full
+frame for absolute coords), `O` = reset to full, `b` = cycle binning 1→2→4. Each runs
+through a `_restart` helper that stops the engine, changes the region, and restarts —
+**blocked while recording** (the video frame size is fixed at record start).
+
+**Validated on hardware (both cameras):**
+
+- Basler: full sensor is actually **1456×1088** (the "1440" is nominal); `set_roi`
+  exact to pixel increments; `reset_roi` restores full; binning to 4×4.
+- Zelux: ROI snaps to even boundaries (720×540 @ y270 → 720×544 @ y268); binning to
+  16×16.
+- Engine restart through region changes: full → 2×2 bin (728×544) → ROI (400×300),
+  frames grab at the new size each time. Only the interactive `selectROI` box-draw
+  needs the window (Remote Desktop).
+
+**Stage 2 complete.** Gain, histogram/saturation, auto-exposure, snapshot formats,
+numeric entry (Round A) + ROI/binning (Round B) — all on the shared engine + drivers
+behind `CameraBase`, reused by the GUIs and ready for the dock/DAQ.
+
 ## 2026-06-12 — Stage 2 Round A: gain, histogram, auto-exp, snapshots, numeric entry
 
 **Context.** Discrete feature widgets on top of the Stage 1 engine. Camera-agnostic

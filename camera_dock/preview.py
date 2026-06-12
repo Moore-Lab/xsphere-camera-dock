@@ -88,6 +88,17 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
     fps_top = min(fps_hi, fps_cap) if (has_fps and fps_cap) else fps_hi
     has_gain = gain_hi > gain_lo
 
+    try:
+        camera.roi_range()
+        has_roi = True
+    except Exception:
+        has_roi = False
+    try:
+        bx_max, by_max = camera.binning_range()
+    except Exception:
+        bx_max = by_max = 1
+    has_binning = max(bx_max, by_max) > 1
+
     camera.set_exposure(min(5000.0, exp_hi))
     if has_fps:
         camera.set_frame_rate(min(fps_top, fps_hi))
@@ -160,12 +171,49 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
         entry_field, entry_buf = None, ""
 
     w, h = camera.sensor_size()
+    region_keys = (" o=ROI O=reset" if has_roi else "") + (" b=bin" if has_binning else "")
     print(f"Live: {info.get('model')} s/n {info.get('serial')}  ({w}x{h}, {bit_depth}-bit).  "
-          f"e/t/g=type value  a=auto-exp  h=hist  f=fmt  s=snap  r=rec  q/ESC=quit")
+          f"e/t/g=type  a=auto-exp  h=hist  f=fmt  s=snap  r=rec{region_keys}  q/ESC=quit")
 
     prev_n, prev_t0, preview_fps = 0, perf_counter(), 0.0
     last_index = -1
     frame = frame8 = None
+
+    def _restart(action) -> None:
+        """Stop the engine, change the sensor region, restart. Blocked while recording."""
+        nonlocal last_index, frame8
+        if recorder is not None:
+            print("stop recording before changing ROI / binning")
+            return
+        engine.stop()
+        try:
+            action()
+        except Exception as exc:
+            print(f"ROI/binning change failed: {exc}")
+        engine.start()
+        last_index, frame8 = -1, None
+
+    def do_roi_select() -> None:
+        camera.reset_roi()                      # select on the full frame for absolute coords
+        camera.start(False)
+        f = camera.grab()
+        camera.stop()
+        sel = cv2.selectROI(window, to_8bit(f), showCrosshair=False, fromCenter=False)
+        x, y, wd, ht = sel
+        if wd > 0 and ht > 0:
+            camera.set_roi(int(x), int(y), int(wd), int(ht))
+            print(f"ROI -> {camera.get_roi()}")
+        else:
+            print("ROI select cancelled (full frame)")
+
+    def do_binning_cycle() -> None:
+        bx, _ = camera.get_binning()
+        nxt = {1: 2, 2: 4, 4: 1}.get(bx, 1)
+        if nxt > max(bx_max, by_max):
+            nxt = 1
+        camera.set_binning(nxt, nxt)
+        print(f"binning -> {camera.get_binning()}, sensor {camera.sensor_size()}")
+
     try:
         while True:
             frame, index = engine.latest()
@@ -240,6 +288,12 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
                 print(f"auto-exposure -> {exp:.0f} us")
             elif key == ord("h"):
                 show_hist = not show_hist
+            elif key == ord("o") and has_roi:
+                _restart(do_roi_select)
+            elif key == ord("O") and has_roi:
+                _restart(camera.reset_roi)
+            elif key == ord("b") and has_binning:
+                _restart(do_binning_cycle)
             elif key == ord("f"):
                 snap_fmt_i = (snap_fmt_i + 1) % len(imaging.SNAPSHOT_FORMATS)
                 print(f"snapshot format -> {imaging.SNAPSHOT_FORMATS[snap_fmt_i]}")
