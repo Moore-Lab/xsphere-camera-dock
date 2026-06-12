@@ -13,6 +13,26 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-06-12 — Dock web app: live controls
+
+**Context.** Drive the camera from the browser (next after streaming).
+
+- `camera_dock/webapp.py`: added control endpoints over the shared engine —
+  `GET /controls` (values + ranges + capability flags + rec state),
+  `POST /controls/exposure|gain|fps|auto_exposure`, `POST /controls/roi` +
+  `/controls/roi/reset` (stop engine → set region → restart; **409 while recording**),
+  `POST /record/start` + `/record/stop` (→ encode stats via HybridRecorder),
+  `POST /snapshot/save`. Blocking ops are sync `def` so FastAPI runs them off the event
+  loop; ROI/record guarded by a lock. The HTML page now has a control panel (geometric
+  exposure slider, gain/fps sliders, auto-exposure, snapshot, ROI x,y,w,h set/reset,
+  record toggle with live stats) — all reusing the same `CameraBase` surface as the GUIs.
+
+**Validated on hardware (Basler, server + curl):** exposure 3000 us, gain 6 dB,
+auto-exposure → 57 ms (converged), ROI 720×540 then reset to 1456×1088, record →
+35 frames 0 dropped encoded. All endpoints return expected JSON.
+
+**Next:** multi-camera streaming (pick/stream several cameras at once).
+
 ## 2026-06-12 — Dock web app: stream the camera feed (first web UI)
 
 **Context.** Start of the dock's web UI — "a webpage that streams the camera feed."
