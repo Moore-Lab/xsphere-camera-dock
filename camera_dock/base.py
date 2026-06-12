@@ -61,6 +61,16 @@ class CameraBase(Protocol):
 
     def resulting_frame_rate(self) -> float: ...
 
+    # --- gain (optional capability) ---
+    # Drivers expose these; a camera without gain returns (0, 0) from
+    # ``gain_range`` and makes ``set_gain`` a no-op, so callers can feature-detect
+    # by checking the range (max > min) rather than catching exceptions.
+    def set_gain(self, value: float) -> None: ...
+
+    def get_gain(self) -> float: ...
+
+    def gain_range(self) -> Tuple[float, float]: ...
+
     # --- acquisition ---
     def start(self, max_throughput: bool = False) -> None: ...
 

@@ -3,22 +3,26 @@
 This is the camera-agnostic preview/record harness that each per-camera ``gui.py``
 launches with its own driver (``run(BaslerACA1440())`` etc.). It is built entirely
 on :class:`~camera_dock.base.CameraBase` plus the shared
-:class:`~camera_dock.engine.AcquisitionEngine` and
-:class:`~camera_dock.recorder.HybridRecorder`, so the same code drives the test
-GUIs today and the dock's preview panes tomorrow.
+:class:`~camera_dock.engine.AcquisitionEngine`,
+:class:`~camera_dock.recorder.HybridRecorder`, and the helpers in
+:mod:`camera_dock.imaging` — so the same code drives the test GUIs today and the
+dock's preview panes tomorrow.
 
-Key behaviour (vs. a naive single-loop GUI): acquisition runs on its own thread at
-the camera's full rate; the window just samples the latest frame at ~30 fps. The
-overlay shows **two** rates honestly — the true acquisition fps and the preview
-fps. Recording captures every frame at the acquisition rate (no drops), then
-encodes to a lossless video after you press stop.
+Acquisition runs on its own thread at the camera's full rate; the window just
+samples the latest frame at ~30 fps. The overlay shows the true acquisition fps
+*and* the preview fps. Recording captures every frame at the acquisition rate (no
+drops), then encodes to a lossless video after you press stop.
 
 Controls
 --------
-    exposure / fps : trackbars at the top
-    s              : snapshot   -> captures/   (full bit depth, TIFF)
-    r              : record on/off -> recordings/   (encodes on stop)
-    q or ESC       : quit
+    exposure / fps / gain : trackbars at the top
+    e / t / g             : type an exact exposure / fps / gain (digits, Enter)
+    a                     : one-shot auto-exposure
+    h                     : toggle histogram
+    f                     : cycle snapshot format (tiff/png/npy)
+    s                     : snapshot     -> captures/
+    r                     : record on/off -> recordings/ (encodes on stop)
+    q or ESC              : quit
 """
 
 from __future__ import annotations
@@ -31,11 +35,12 @@ from time import perf_counter
 import cv2
 import numpy as np
 
+from . import imaging
 from .engine import AcquisitionEngine
 from .recorder import HybridRecorder
 
 STEPS = 1000              # trackbar integer resolution
-PREVIEW_FPS = 30.0        # how often the window refreshes (independent of capture)
+PREVIEW_FPS = 30.0        # window refresh rate (independent of capture)
 
 
 def _geom(lo: float, hi: float, frac: float) -> float:
@@ -55,17 +60,13 @@ def _make_to_8bit(bit_depth: int):
     return lambda f: (f >> shift).astype(np.uint8)
 
 
+def _clamp_pos(pos: float) -> int:
+    return int(max(0, min(STEPS, pos)))
+
+
 def run(camera, *, title: str | None = None, fps_cap: float | None = None,
         exp_cap_us: float = 100_000.0) -> None:
-    """Launch the shared test GUI against ``camera`` (a connected-or-not driver).
-
-    Parameters
-    ----------
-    camera:    any :class:`~camera_dock.base.CameraBase` driver instance.
-    title:     window title; defaults to the camera model.
-    fps_cap:   upper end of the fps slider; defaults to the camera's max.
-    exp_cap_us: upper end of the exposure slider.
-    """
+    """Launch the shared test GUI against ``camera`` (a connected-or-not driver)."""
     try:
         camera.connect()
     except Exception as exc:
@@ -75,43 +76,96 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
 
     info = camera.device_info
     bit_depth = int(getattr(camera, "bit_depth", 8))
+    max_value = imaging.max_value_for(bit_depth)
     to_8bit = _make_to_8bit(bit_depth)
     window = title or f"{info.get('model', 'camera')} - test GUI"
 
     exp_lo, exp_hi = camera.exposure_range()
     fps_lo, fps_hi = camera.frame_rate_range()
+    gain_lo, gain_hi = camera.gain_range()
     exp_cap = min(exp_hi, exp_cap_us)
     has_fps = fps_hi > 0
     fps_top = min(fps_hi, fps_cap) if (has_fps and fps_cap) else fps_hi
+    has_gain = gain_hi > gain_lo
 
     camera.set_exposure(min(5000.0, exp_hi))
     if has_fps:
         camera.set_frame_rate(min(fps_top, fps_hi))
 
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window, 960, 760)
+    cv2.resizeWindow(window, 960, 780)
 
     cv2.createTrackbar("exposure", window,
-                       int(_geom_frac(exp_lo, exp_cap, camera.get_exposure()) * STEPS),
+                       _clamp_pos(_geom_frac(exp_lo, exp_cap, camera.get_exposure()) * STEPS),
                        STEPS, lambda v: camera.set_exposure(_geom(exp_lo, exp_cap, v / STEPS)))
     if has_fps:
         cv2.createTrackbar("fps", window,
-                           int((camera.get_frame_rate() - fps_lo) / (fps_top - fps_lo) * STEPS),
+                           _clamp_pos((camera.get_frame_rate() - fps_lo) / (fps_top - fps_lo) * STEPS),
                            STEPS,
                            lambda v: camera.set_frame_rate(fps_lo + (fps_top - fps_lo) * v / STEPS))
+    if has_gain:
+        cv2.createTrackbar("gain", window,
+                           _clamp_pos((camera.get_gain() - gain_lo) / (gain_hi - gain_lo) * STEPS),
+                           STEPS, lambda v: camera.set_gain(gain_lo + (gain_hi - gain_lo) * v / STEPS))
+
+    # --- trackbar sync (after numeric entry / auto-exposure set a value) ---
+    def sync_exposure():
+        cv2.setTrackbarPos("exposure", window,
+                           _clamp_pos(_geom_frac(exp_lo, exp_cap, camera.get_exposure()) * STEPS))
+
+    def sync_fps():
+        if has_fps:
+            cv2.setTrackbarPos("fps", window,
+                               _clamp_pos((camera.get_frame_rate() - fps_lo) / (fps_top - fps_lo) * STEPS))
+
+    def sync_gain():
+        if has_gain:
+            cv2.setTrackbarPos("gain", window,
+                               _clamp_pos((camera.get_gain() - gain_lo) / (gain_hi - gain_lo) * STEPS))
 
     engine = AcquisitionEngine(camera)
     engine.start()
     recorder: HybridRecorder | None = None
     rec_path = ""
 
+    # fresh-frame grab for auto-exposure: wait a few frames after an exposure change
+    def grab_fresh():
+        _, start = engine.latest()
+        t0 = perf_counter()
+        while perf_counter() - t0 < 2.0:
+            frame, idx = engine.latest()
+            if frame is not None and idx >= start + 4:
+                return frame
+            cv2.waitKey(5)
+        return engine.latest()[0]
+
+    snap_fmt_i = 0
+    show_hist = False
+    entry_field: str | None = None
+    entry_buf = ""
+
+    def apply_entry():
+        nonlocal entry_field, entry_buf
+        try:
+            val = float(entry_buf)
+        except ValueError:
+            val = None
+        if val is not None:
+            if entry_field == "exposure":
+                camera.set_exposure(val); sync_exposure()
+            elif entry_field == "gain" and has_gain:
+                camera.set_gain(val); sync_gain()
+            elif entry_field == "fps" and has_fps:
+                camera.set_frame_rate(val); sync_fps()
+        entry_field, entry_buf = None, ""
+
     w, h = camera.sensor_size()
     print(f"Live: {info.get('model')} s/n {info.get('serial')}  ({w}x{h}, {bit_depth}-bit).  "
-          f"s=snapshot  r=record  q/ESC=quit")
+          f"e/t/g=type value  a=auto-exp  h=hist  f=fmt  s=snap  r=rec  q/ESC=quit")
 
     prev_n, prev_t0, preview_fps = 0, perf_counter(), 0.0
     last_index = -1
-    frame8 = None
+    frame = frame8 = None
     try:
         while True:
             frame, index = engine.latest()
@@ -125,19 +179,32 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
                 continue
 
             bgr = cv2.cvtColor(frame8, cv2.COLOR_GRAY2BGR)
+            if show_hist:
+                imaging.histogram_overlay(bgr, frame8)
 
             prev_n += 1
             now = perf_counter()
             if now - prev_t0 >= 0.5:
                 preview_fps, prev_n, prev_t0 = prev_n / (now - prev_t0), 0, now
 
+            sat = imaging.saturation_fraction(frame, max_value) * 100.0
             target = f"{camera.get_frame_rate():.1f}" if has_fps else "n/a"
-            status = (f"acq {engine.acquisition_fps:5.1f} fps   preview {preview_fps:4.1f} fps   "
-                      f"exp {camera.get_exposure():.0f} us   target {target}")
-            cv2.putText(bgr, status, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            gain_txt = f"   gain {camera.get_gain():.1f}" if has_gain else ""
+            status = (f"acq {engine.acquisition_fps:5.1f}  prev {preview_fps:4.1f}  "
+                      f"exp {camera.get_exposure():.0f}us  fps {target}{gain_txt}  sat {sat:4.1f}%")
+            cv2.putText(bgr, status, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 255, 0), 1, cv2.LINE_AA)
+
+            line2 = None
+            if entry_field is not None:
+                line2 = f"{entry_field} = {entry_buf}_  (Enter=set  ESC=cancel)"
+            else:
+                line2 = f"fmt={imaging.SNAPSHOT_FORMATS[snap_fmt_i]}"
+            cv2.putText(bgr, line2, (10, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 255, 255), 1, cv2.LINE_AA)
+
             if recorder is not None:
-                cv2.putText(bgr, f"REC {recorder._captured}", (bgr.shape[1] - 150, 24),
+                cv2.putText(bgr, f"REC {recorder._captured}", (bgr.shape[1] - 150, 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
             cv2.imshow(window, bgr)
 
@@ -145,13 +212,42 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
                 break
 
             key = cv2.waitKey(max(1, int(1000 / PREVIEW_FPS))) & 0xFF
+
+            # --- numeric entry mode captures all keys until Enter/ESC ---
+            if entry_field is not None:
+                if key in (13, 10):
+                    apply_entry()
+                elif key == 27:
+                    entry_field, entry_buf = None, ""
+                elif key == 8:
+                    entry_buf = entry_buf[:-1]
+                elif key != 255 and chr(key) in "0123456789.":
+                    entry_buf += chr(key)
+                continue
+
             if key in (27, ord("q")):
                 break
+            elif key == ord("e"):
+                entry_field, entry_buf = "exposure", ""
+            elif key == ord("t") and has_fps:
+                entry_field, entry_buf = "fps", ""
+            elif key == ord("g") and has_gain:
+                entry_field, entry_buf = "gain", ""
+            elif key == ord("a"):
+                print("auto-exposing...")
+                exp = imaging.auto_expose(camera, grab_fresh)
+                sync_exposure()
+                print(f"auto-exposure -> {exp:.0f} us")
+            elif key == ord("h"):
+                show_hist = not show_hist
+            elif key == ord("f"):
+                snap_fmt_i = (snap_fmt_i + 1) % len(imaging.SNAPSHOT_FORMATS)
+                print(f"snapshot format -> {imaging.SNAPSHOT_FORMATS[snap_fmt_i]}")
             elif key == ord("s"):
                 os.makedirs("captures", exist_ok=True)
-                name = datetime.now().strftime(f"captures/{_slug(info)}_%Y%m%d_%H%M%S_%f.tiff")
-                cv2.imwrite(name, frame)   # native full bit depth
-                print(f"snapshot -> {name}")
+                base = datetime.now().strftime(f"captures/{_slug(info)}_%Y%m%d_%H%M%S_%f")
+                path = imaging.save_snapshot(frame, base, imaging.SNAPSHOT_FORMATS[snap_fmt_i])
+                print(f"snapshot -> {path}")
             elif key == ord("r"):
                 if recorder is None:
                     recorder = HybridRecorder()
