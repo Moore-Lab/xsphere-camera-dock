@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+from datetime import datetime, timedelta
 from time import perf_counter
 from typing import Callable, Optional
 
@@ -35,6 +36,8 @@ import numpy as np
 
 # Convert a native mono frame (uint8 or uint16) to a uint8 2-D array for video.
 To8Bit = Callable[[np.ndarray], np.ndarray]
+# Burn an overlay (e.g. a timestamp) onto a BGR frame, given that frame's wall time.
+Stamp = Callable[[np.ndarray, datetime], None]
 
 
 class HybridRecorder:
@@ -52,8 +55,13 @@ class HybridRecorder:
         self,
         ram_cap_bytes: int = 2_000_000_000,
         queue_frames: int = 256,
+        clock: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.ram_cap_bytes = int(ram_cap_bytes)
+        self._clock = clock          # returns the current wall time (e.g. New Haven)
+        self._times: list[float] = []  # per-frame perf timestamps, in capture order
+        self._t0_perf: Optional[float] = None
+        self._t0_wall: Optional[datetime] = None
         self._ram: list[np.ndarray] = []
         self._ram_bytes = 0
 
@@ -80,7 +88,11 @@ class HybridRecorder:
         if self._shape is None:
             self._shape, self._dtype = frame.shape, frame.dtype
             self._t_first = t
+            self._t0_perf = t
+            if self._clock is not None:
+                self._t0_wall = self._clock()   # anchor wall time to this first frame
         self._t_last = t
+        self._times.append(t)                   # tiny; kept for every frame even if spilled
         self._captured += 1
 
         if not self._spilling and self._ram_bytes < self.ram_cap_bytes:
@@ -115,11 +127,14 @@ class HybridRecorder:
             self._spilled += 1
 
     # --- finalize ----------------------------------------------------------
-    def stop_and_encode(self, path: str, fps: float, to_8bit: To8Bit) -> dict:
+    def stop_and_encode(self, path: str, fps: float, to_8bit: To8Bit,
+                        stamp: Optional[Stamp] = None) -> dict:
         """Stop accepting frames and encode everything to a lossless video.
 
         Call only after the engine's sink has been detached (no more ``submit``).
-        Returns a stats dict. ``path`` should end in ``.avi``.
+        If ``stamp`` is given, each frame is annotated with its own capture-time
+        wall clock (anchored at the first frame) — burning the timestamp into the
+        movie. Returns a stats dict. ``path`` should end in ``.avi``.
         """
         self._closed = True
 
@@ -143,9 +158,9 @@ class HybridRecorder:
                 return self._stats(path, capture_fps, capture_seconds, 0.0, encoded, ok=False)
             try:
                 for frame in self._ram:
-                    writer.write(cv2.cvtColor(to_8bit(frame), cv2.COLOR_GRAY2BGR))
+                    self._write_frame(writer, frame, to_8bit, stamp, encoded)
                     encoded += 1
-                encoded += self._encode_spill(writer, to_8bit)
+                encoded += self._encode_spill(writer, to_8bit, stamp, encoded)
             finally:
                 writer.release()
 
@@ -158,7 +173,14 @@ class HybridRecorder:
 
         return self._stats(path, capture_fps, capture_seconds, perf_counter() - encode_t0, encoded, ok=True)
 
-    def _encode_spill(self, writer, to_8bit: To8Bit) -> int:
+    def _write_frame(self, writer, frame, to_8bit: To8Bit, stamp: Optional[Stamp], idx: int) -> None:
+        bgr = cv2.cvtColor(to_8bit(frame), cv2.COLOR_GRAY2BGR)
+        if stamp is not None and self._t0_wall is not None and idx < len(self._times):
+            dt = self._t0_wall + timedelta(seconds=self._times[idx] - self._t0_perf)
+            stamp(bgr, dt)
+        writer.write(bgr)
+
+    def _encode_spill(self, writer, to_8bit: To8Bit, stamp: Optional[Stamp], start_idx: int) -> int:
         if not self._spilling or not self._spill_path or not os.path.exists(self._spill_path):
             return 0
         n = 0
@@ -169,7 +191,7 @@ class HybridRecorder:
                 if len(raw) < frame_bytes:
                     break
                 frame = np.frombuffer(raw, dtype=self._dtype).reshape(self._shape)
-                writer.write(cv2.cvtColor(to_8bit(frame), cv2.COLOR_GRAY2BGR))
+                self._write_frame(writer, frame, to_8bit, stamp, start_idx + n)
                 n += 1
         return n
 

@@ -254,6 +254,7 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
             if recorder is not None:
                 cv2.putText(bgr, f"REC {recorder._captured}", (bgr.shape[1] - 150, 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+            imaging.draw_timestamp(bgr, imaging.eastern_now())   # New Haven time (live)
             cv2.imshow(window, bgr)
 
             if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
@@ -304,7 +305,7 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
                 print(f"snapshot -> {path}")
             elif key == ord("r"):
                 if recorder is None:
-                    recorder = HybridRecorder()
+                    recorder = HybridRecorder(clock=imaging.eastern_now)
                     engine.set_sink(recorder.submit)
                     os.makedirs("recordings", exist_ok=True)
                     rec_path = datetime.now().strftime(f"recordings/{_slug(info)}_%Y%m%d_%H%M%S.avi")
@@ -313,7 +314,8 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
                     engine.set_sink(None)
                     fps = engine.acquisition_fps or camera.get_frame_rate() or 30.0
                     print("encoding...")
-                    stats = recorder.stop_and_encode(rec_path, fps, to_8bit)
+                    stats = recorder.stop_and_encode(rec_path, fps, to_8bit,
+                                                     stamp=imaging.draw_timestamp)
                     recorder = None
                     print(f"recording saved -> {stats['path']}  "
                           f"({stats['encoded']} frames @ {stats['capture_fps']} fps capture, "

@@ -13,6 +13,30 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-06-12 — New Haven timestamp burned into preview + movie
+
+**Context.** Request: show the New Haven date/time in the window *and* have it recorded
+in the movie. Key subtlety — the recorder stores **clean raw frames** (the preview's
+status overlay is not in the video), so the timestamp has to be burned into the recorded
+frames separately, not just shown live.
+
+- `camera_dock/imaging.py`: `eastern_now()` (America/New_York, DST-aware via `zoneinfo`),
+  `format_timestamp` (`YYYY-MM-DD HH:MM:SS.mmm EDT/EST`), `draw_timestamp` (burns it into
+  a BGR frame, bottom-right, font scales with width).
+- `camera_dock/recorder.py`: `HybridRecorder(clock=...)` anchors a wall time to the first
+  frame and keeps a per-frame perf timestamp for **every** frame (even spilled ones).
+  `stop_and_encode(..., stamp=draw_timestamp)` annotates each frame with **its own
+  capture time** at encode — so the movie shows true per-frame New Haven time, not the
+  encode time.
+- `camera_dock/preview.py`: draws the live timestamp every frame, creates the recorder
+  with `clock=eastern_now`, and passes `stamp=draw_timestamp` on stop.
+- `requirements.txt`: added `opencv-python` (the dock modules use cv2) and `tzdata`
+  (IANA tz db for `zoneinfo` on Windows).
+
+**Validated:** tz resolves to EDT; a recorded clip has a non-blank bottom-right stamp
+region that changes frame-to-frame as time advances (per-frame timestamps confirmed),
+45/45 frames, 0 dropped.
+
 ## 2026-06-12 — Stage 2 Round B: ROI / binning
 
 **Context.** The last Stage 2 feature — held back because it must stop acquisition to

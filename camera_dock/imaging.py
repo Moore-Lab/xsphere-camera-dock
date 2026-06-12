@@ -7,10 +7,17 @@ histogram + saturation, software one-shot auto-exposure, and multi-format snapsh
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Callable, Optional
 
 import cv2
 import numpy as np
+
+try:
+    from zoneinfo import ZoneInfo
+    _EASTERN: Optional["ZoneInfo"] = ZoneInfo("America/New_York")  # New Haven, CT (DST-aware)
+except Exception:
+    _EASTERN = None  # tz database unavailable (see camera_dock requirements: tzdata)
 
 # Snapshot formats: tiff/png are lossless and preserve bit depth; npy is the raw
 # native array (exact sensor values, no image-format quantisation).
@@ -85,6 +92,46 @@ def auto_expose(camera, grab_fresh: Callable[[], Optional[np.ndarray]], *,
         if abs(level - target) <= tol:
             break
     return camera.get_exposure()
+
+
+def eastern_now() -> datetime:
+    """Current wall-clock time in New Haven, CT (America/New_York, DST-aware).
+
+    Falls back to the system local time zone if the IANA tz database is missing
+    (install ``tzdata`` on Windows — see the dock requirements).
+    """
+    if _EASTERN is not None:
+        return datetime.now(_EASTERN)
+    return datetime.now().astimezone()
+
+
+def format_timestamp(dt: datetime) -> str:
+    """e.g. ``2026-06-12 14:30:45.123 EDT`` (millisecond precision + tz label)."""
+    tz = dt.tzname() or ""
+    return (dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+            + (f" {tz}" if tz else ""))
+
+
+def draw_timestamp(bgr: np.ndarray, dt: datetime, *, scale: float | None = None) -> np.ndarray:
+    """Burn a New-Haven timestamp into the bottom-right of a BGR image (mutates it).
+
+    Used both for the live preview and, at encode time, for each recorded frame —
+    so the date/time is permanently in the movie. Font scales with frame width.
+    """
+    text = format_timestamp(dt)
+    h, w = bgr.shape[:2]
+    fs = scale if scale is not None else max(0.4, w / 1600.0)
+    th = max(1, int(round(fs * 2)))
+    (tw, tht), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+    pad = 6
+    x = max(0, w - tw - 2 * pad)
+    y = h - pad
+    backdrop = bgr.copy()
+    cv2.rectangle(backdrop, (x, y - tht - base - pad), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(backdrop, 0.5, bgr, 0.5, 0, bgr)
+    cv2.putText(bgr, text, (x + pad, y - base), cv2.FONT_HERSHEY_SIMPLEX, fs,
+                (0, 255, 0), th, cv2.LINE_AA)
+    return bgr
 
 
 def save_snapshot(frame: np.ndarray, path_base: str, fmt: str = "tiff") -> str:

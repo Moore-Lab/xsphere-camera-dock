@@ -1,5 +1,7 @@
 # Dock-level dependencies. Per-camera SDKs live in each submodule's requirements.txt.
 numpy
+opencv-python          # acquisition engine, recorder, preview GUI, imaging helpers
+tzdata                 # IANA tz database for zoneinfo (New Haven timestamps on Windows)
 # Web app / streaming layer (framework TBD during planning)
 # fastapi
 # uvicorn
