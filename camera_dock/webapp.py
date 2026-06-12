@@ -171,6 +171,7 @@ class CameraSession:
         el, eh = c.exposure_range()
         fl, fh = c.frame_rate_range()
         return {"exposure": c.get_exposure(), "exposure_range": [el, eh],
+                "has_exposure": eh > el,
                 "gain": c.get_gain(), "gain_range": [gl, gh], "has_gain": gh > gl,
                 "fps": c.get_frame_rate(), "fps_range": [fl, fh], "has_fps": fh > 0,
                 "roi": list(c.get_roi()) if self.has_roi else None,
@@ -462,7 +463,7 @@ _CONTROL = """<!doctype html>
         <input type="range" id="gain" min="0" max="1000"></div>
       <div class="row" id="fps-row"><label>fps <span class="val" id="fps-v"></span></label>
         <input type="range" id="fps" min="0" max="1000"></div>
-      <div class="row"><button onclick="autoExp()">auto-exposure</button>
+      <div class="row"><button id="autoexp" onclick="autoExp()">auto-exposure</button>
         <button onclick="save()">snapshot</button></div>
       <div class="row" id="roi-row"><label>ROI x,y,w,h</label>
         <input type="text" id="roi" placeholder="x,y,w,h">
@@ -488,7 +489,8 @@ function bindLin(id,lo,hi,val,name,fmt){const s=$(id); s.value=Math.round((val-l
   s.oninput=async()=>{const v=lo+(hi-lo)*s.value/1000; $(id+'-v').textContent=fmt(v);
     const r=await post('/controls/'+name+'?value='+v); $(id+'-v').textContent=fmt(r[name]);};}
 async function load(){R=await (await fetch(BASE+'/controls')).json();
-  bindGeom('exp',R.exposure_range[0],R.exposure_range[1],R.exposure,'exposure',v=>v.toFixed(0));
+  if(R.has_exposure) bindGeom('exp',R.exposure_range[0],R.exposure_range[1],R.exposure,'exposure',v=>v.toFixed(0));
+  else { $('exp-row').style.display='none'; $('autoexp').style.display='none'; }
   if(R.has_gain) bindLin('gain',R.gain_range[0],R.gain_range[1],R.gain,'gain',v=>v.toFixed(1)); else $('gain-row').style.display='none';
   if(R.has_fps) bindLin('fps',R.fps_range[0],R.fps_range[1],R.fps,'fps',v=>v.toFixed(1)); else $('fps-row').style.display='none';
   if(R.has_roi) $('roi').value=R.roi.join(','); else $('roi-row').style.display='none';

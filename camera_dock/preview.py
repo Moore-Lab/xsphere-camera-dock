@@ -84,6 +84,7 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
     fps_lo, fps_hi = camera.frame_rate_range()
     gain_lo, gain_hi = camera.gain_range()
     exp_cap = min(exp_hi, exp_cap_us)
+    has_exposure = exp_hi > exp_lo
     has_fps = fps_hi > 0
     fps_top = min(fps_hi, fps_cap) if (has_fps and fps_cap) else fps_hi
     has_gain = gain_hi > gain_lo
@@ -99,16 +100,18 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
         bx_max = by_max = 1
     has_binning = max(bx_max, by_max) > 1
 
-    camera.set_exposure(min(5000.0, exp_hi))
+    if has_exposure:
+        camera.set_exposure(min(5000.0, exp_hi))
     if has_fps:
         camera.set_frame_rate(min(fps_top, fps_hi))
 
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window, 960, 780)
 
-    cv2.createTrackbar("exposure", window,
-                       _clamp_pos(_geom_frac(exp_lo, exp_cap, camera.get_exposure()) * STEPS),
-                       STEPS, lambda v: camera.set_exposure(_geom(exp_lo, exp_cap, v / STEPS)))
+    if has_exposure:
+        cv2.createTrackbar("exposure", window,
+                           _clamp_pos(_geom_frac(exp_lo, exp_cap, camera.get_exposure()) * STEPS),
+                           STEPS, lambda v: camera.set_exposure(_geom(exp_lo, exp_cap, v / STEPS)))
     if has_fps:
         cv2.createTrackbar("fps", window,
                            _clamp_pos((camera.get_frame_rate() - fps_lo) / (fps_top - fps_lo) * STEPS),
@@ -121,8 +124,9 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
 
     # --- trackbar sync (after numeric entry / auto-exposure set a value) ---
     def sync_exposure():
-        cv2.setTrackbarPos("exposure", window,
-                           _clamp_pos(_geom_frac(exp_lo, exp_cap, camera.get_exposure()) * STEPS))
+        if has_exposure:
+            cv2.setTrackbarPos("exposure", window,
+                               _clamp_pos(_geom_frac(exp_lo, exp_cap, camera.get_exposure()) * STEPS))
 
     def sync_fps():
         if has_fps:
@@ -238,8 +242,9 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
             sat = imaging.saturation_fraction(frame, max_value) * 100.0
             target = f"{camera.get_frame_rate():.1f}" if has_fps else "n/a"
             gain_txt = f"   gain {camera.get_gain():.1f}" if has_gain else ""
+            exp_txt = f"exp {camera.get_exposure():.0f}us  " if has_exposure else ""
             status = (f"acq {engine.acquisition_fps:5.1f}  prev {preview_fps:4.1f}  "
-                      f"exp {camera.get_exposure():.0f}us  fps {target}{gain_txt}  sat {sat:4.1f}%")
+                      f"{exp_txt}fps {target}{gain_txt}  sat {sat:4.1f}%")
             cv2.putText(bgr, status, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 255, 0), 1, cv2.LINE_AA)
 
@@ -276,13 +281,13 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
 
             if key in (27, ord("q")):
                 break
-            elif key == ord("e"):
+            elif key == ord("e") and has_exposure:
                 entry_field, entry_buf = "exposure", ""
             elif key == ord("t") and has_fps:
                 entry_field, entry_buf = "fps", ""
             elif key == ord("g") and has_gain:
                 entry_field, entry_buf = "gain", ""
-            elif key == ord("a"):
+            elif key == ord("a") and has_exposure:
                 print("auto-exposing...")
                 exp = imaging.auto_expose(camera, grab_fresh)
                 sync_exposure()

@@ -13,6 +13,29 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-06-12 — Hayear HY-1136 (UVC) + has_exposure gating
+
+**Context.** The connected Hayear (HY-1136) turned out to be a **UVC webcam-class colour
+camera**, not a ToupCam-SDK device (the hycam SDK enumerates 0; it streams via
+DirectShow). Added it as a UVC camera and taught the dock to handle a camera with no
+exposure control.
+
+- `hayear/` driver rewritten from the (wrong) hycam-SDK scaffold to **UVC/OpenCV**:
+  `HayearCamera` over `cv2.VideoCapture` (DSHOW index 0), modes 640×480/720p/1080p,
+  BGR→mono uint8. Exposure/gain/frame-rate/ROI are unsupported (auto-only over UVC) and
+  report empty ranges. (Still an **untracked** local module pending its own Moore-Lab
+  repo; `_make_camera` already maps `hayear`.)
+- **`has_exposure` capability gating** added to `preview.py` and `webapp.py` (parallel to
+  has_gain/has_fps/has_roi): controls report it; the test GUI skips the exposure
+  trackbar / numeric entry / auto-exposure when unsupported (was crashing on a 0-range
+  exposure slider); the web control page hides the exposure row + auto-exposure button.
+  `controls()` now includes `has_exposure`.
+
+**Validated on the connected HY-1136:** driver conforms to `CameraBase`; streams mono
+1080p through the engine at 30 fps (0 dropped recording); in the dock via
+`python -m xsphere_daq.panel hayear` — info/stream/snapshot/record all work and
+`controls` reports has_exposure/gain/fps/roi all false (controls correctly gated off).
+
 ## 2026-06-12 — webapp: mountable as a sub-application
 
 **Context.** Make the camera app mountable under a path prefix so the top-level
