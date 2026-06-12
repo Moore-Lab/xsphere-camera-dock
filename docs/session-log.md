@@ -13,6 +13,30 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-06-12 — Dock web app: settings presets
+
+**Context.** Make camera setups reproducible across restarts (important for the
+experiment) and bring the rig up pre-configured.
+
+- `camera_dock/presets.py` — camera-agnostic capture/apply/save/load of exposure,
+  gain, frame rate, ROI, binning to `presets/<camera>__<name>.json`. Built only on
+  `CameraBase`.
+- `webapp.py`: per-camera endpoints `GET /cam/{name}/presets`,
+  `POST /cam/{name}/presets/save?preset=`, `POST /cam/{name}/presets/load?preset=`
+  (ROI applied via the stop→set→restart region change; 409 while recording, 404 if
+  missing). `CameraSession.start()` **auto-applies a `default` preset** if present, so
+  the rig comes up configured. Control page gains a preset save/load row (with a
+  datalist of existing presets).
+- `.gitignore`: ignore `presets/` (local rig state).
+
+**Validated on hardware (Basler, server + curl):** set exp 2500 / gain 4 / ROI
+200,150,800,600 → save `expt1` → change everything away → load `expt1` → all three
+restored exactly; missing preset → 404; saved a `default`, restarted the server, and
+it **auto-loaded on startup** (exp/gain/ROI all applied).
+
+**Next (dock):** ROI box-draw on the live stream, and promote the dock up into the
+top-level `xsphere-daq` control panel.
+
 ## 2026-06-12 — Dock web app: multi-camera streaming
 
 **Context.** One server driving several cameras at once.

@@ -8,6 +8,6 @@ The shared interface every camera module is expected to implement lives in
 from .base import CameraBase
 from .engine import AcquisitionEngine
 from .recorder import HybridRecorder
-from . import imaging, preview
+from . import imaging, presets, preview
 
-__all__ = ["CameraBase", "AcquisitionEngine", "HybridRecorder", "imaging", "preview"]
+__all__ = ["CameraBase", "AcquisitionEngine", "HybridRecorder", "imaging", "presets", "preview"]

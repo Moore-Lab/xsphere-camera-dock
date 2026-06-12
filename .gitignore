@@ -9,9 +9,10 @@ dist/
 venv/
 env/
 
-# Captures / recordings (don't commit data)
+# Captures / recordings / local presets (don't commit data / rig state)
 captures/
 recordings/
+presets/
 *.tiff
 *.tif
 *.avi

@@ -41,7 +41,7 @@ from time import perf_counter, sleep
 import cv2
 import numpy as np
 
-from . import imaging
+from . import imaging, presets
 from .engine import AcquisitionEngine
 from .recorder import HybridRecorder
 
@@ -88,6 +88,13 @@ class CameraSession:
             except Exception:
                 self.has_roi = False
             self._apply_defaults()
+            # Bring the rig up configured: apply a saved "default" preset if present
+            # (camera not grabbing yet, so ROI can be set directly).
+            try:
+                if presets.exists(self.name, "default"):
+                    presets.apply(self.camera, presets.load(self.name, "default"))
+            except Exception:
+                pass
             self.engine.start()
             self.ok = True
         except Exception as exc:               # one bad camera shouldn't sink the app
@@ -204,6 +211,22 @@ class CameraSession:
             fps = self.engine.acquisition_fps or self.camera.get_frame_rate() or 30.0
         stats = rec.stop_and_encode(path, fps, self.to8, stamp=imaging.draw_timestamp)
         return {"recording": False, "stats": stats}
+
+    # --- presets ---
+    def save_preset(self, name: str) -> dict:
+        path = presets.save(self.name, name, presets.capture(self.camera, has_roi=self.has_roi))
+        return {"saved": name, "path": path}
+
+    def load_preset(self, name: str) -> dict:
+        settings = presets.load(self.name, name)
+        presets.apply(self.camera, settings, set_roi=False)   # exposure/gain/fps/binning live
+        if self.has_roi and settings.get("roi"):              # ROI needs a region change
+            x, y, w, h = (int(v) for v in settings["roi"])
+            self._change_region(lambda: self.camera.set_roi(x, y, w, h))
+        return {"loaded": name, "settings": settings}
+
+    def list_presets(self) -> list:
+        return presets.list_presets(self.name)
 
 
 class _Conflict(Exception):
@@ -360,6 +383,25 @@ def create_app(sessions: dict):
     def record_stop(name: str):
         return sess(name).record_stop()
 
+    # --- per-camera presets ---
+    @app.get("/cam/{name}/presets")
+    def list_presets(name: str):
+        return sess(name).list_presets()
+
+    @app.post("/cam/{name}/presets/save")
+    def save_preset(name: str, preset: str = "default"):
+        return sess(name).save_preset(preset)
+
+    @app.post("/cam/{name}/presets/load")
+    def load_preset(name: str, preset: str = "default"):
+        s = sess(name)
+        try:
+            return s.load_preset(preset)
+        except FileNotFoundError:
+            raise HTTPException(404, f"no preset '{preset}'")
+        except _Conflict as exc:
+            raise HTTPException(409, str(exc))
+
     return app
 
 
@@ -410,6 +452,9 @@ _CONTROL = """<!doctype html>
         <input type="text" id="roi" placeholder="x,y,w,h">
         <button onclick="setRoi()">set</button> <button onclick="resetRoi()">full</button></div>
       <div class="row"><button id="rec" class="rec" onclick="toggleRec()">● record</button></div>
+      <div class="row"><label>preset</label>
+        <input type="text" id="pname" placeholder="name" list="plist"><datalist id="plist"></datalist>
+        <button onclick="savePreset()">save</button> <button onclick="loadPreset()">load</button></div>
       <div id="stat"></div>
     </div>
   </div>
@@ -431,7 +476,15 @@ async function load(){R=await (await fetch(BASE+'/controls')).json();
   if(R.has_gain) bindLin('gain',R.gain_range[0],R.gain_range[1],R.gain,'gain',v=>v.toFixed(1)); else $('gain-row').style.display='none';
   if(R.has_fps) bindLin('fps',R.fps_range[0],R.fps_range[1],R.fps,'fps',v=>v.toFixed(1)); else $('fps-row').style.display='none';
   if(R.has_roi) $('roi').value=R.roi.join(','); else $('roi-row').style.display='none';
-  setRec(R.recording);}
+  setRec(R.recording); refreshPresets();}
+async function refreshPresets(){try{const l=await (await fetch(BASE+'/presets')).json();
+  $('plist').innerHTML=l.map(n=>`<option value="${n}">`).join('');}catch(e){}}
+async function savePreset(){const n=$('pname').value||'default';
+  const r=await (await fetch(BASE+'/presets/save?preset='+encodeURIComponent(n),{method:'POST'})).json();
+  $('stat').textContent='preset saved → '+r.path; refreshPresets();}
+async function loadPreset(){const n=$('pname').value||'default';
+  const r=await fetch(BASE+'/presets/load?preset='+encodeURIComponent(n),{method:'POST'}); const j=await r.json();
+  $('stat').textContent=r.ok?('preset loaded: '+n):('preset: '+(j.detail||'error')); load();}
 async function autoExp(){$('stat').textContent='auto-exposing…'; const r=await post('/controls/auto_exposure');
   $('stat').textContent='exposure → '+r.exposure.toFixed(0)+' us'; load();}
 async function save(){const r=await post('/snapshot/save'); $('stat').textContent='snapshot → '+r.path;}
