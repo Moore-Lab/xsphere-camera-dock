@@ -13,6 +13,33 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-06-12 — Dock web app: multi-camera streaming
+
+**Context.** One server driving several cameras at once.
+
+- `camera_dock/webapp.py` refactored around a `CameraSession` (camera + engine +
+  recording state + control ops). `create_app(sessions)` manages a dict of sessions;
+  all routes namespaced `/cam/{name}/...`. `/` is an overview page (grid of every
+  camera's live stream, each linking to its full control page at `/cam/{name}`).
+  `/cameras` lists them. Startup is resilient — one camera that fails to connect is
+  marked unavailable (503) without sinking the others.
+- `python -m camera_dock.webapp basler zelux [--host 0.0.0.0 --port 8000]`.
+
+**Two fixes found via concurrent testing:**
+
+- JPEG encode moved off the event loop (`asyncio.to_thread`) so concurrent MJPEG
+  streams interleave fairly (before: one stream starved the other).
+- `CameraSession._apply_defaults()` sets a sane exposure (5 ms) + frame rate (30 fps)
+  on start (mirrors the preview GUI). The Zelux otherwise streamed at ~2.5 fps because
+  frame-rate control was enabled but unset (near its minimum).
+
+**Validated on hardware (Basler + Zelux simultaneously):** both connect; `/cameras` and
+the overview show both; controls are independent (Basler exp 1500 us vs Zelux 7969 us);
+both streams run concurrently at **30 fps engine** (Basler 63 / Zelux 44 frames in 3 s).
+
+**Next (dock):** persist settings / config, ROI box-draw on the stream, and promote the
+dock up into the top-level `xsphere-daq` control panel.
+
 ## 2026-06-12 — Dock web app: live controls
 
 **Context.** Drive the camera from the browser (next after streaming).

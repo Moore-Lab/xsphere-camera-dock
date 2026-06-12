@@ -1,32 +1,31 @@
-"""Dock web app — stream a camera feed and drive it from the browser.
+"""Dock web app — stream and control one or more cameras from the browser.
 
-A FastAPI server that runs any :class:`~camera_dock.base.CameraBase` camera through
-the shared :class:`~camera_dock.engine.AcquisitionEngine`, streams the live frames
-as MJPEG, and exposes the camera's controls (exposure, gain, frame rate, ROI,
-auto-exposure, recording) as endpoints — all over the same surface the test GUIs
-use, so nothing is duplicated.
+A FastAPI server that runs each :class:`~camera_dock.base.CameraBase` camera through
+its own shared :class:`~camera_dock.engine.AcquisitionEngine`, streams the live
+frames as MJPEG, and exposes the camera's controls (exposure, gain, frame rate, ROI,
+auto-exposure, recording) as endpoints. One server can drive several cameras at once
+— each gets its own namespace ``/cam/{name}/...`` — all over the same `CameraBase`
+surface the test GUIs use, so nothing is duplicated.
 
 Run it::
 
-    python -m camera_dock.webapp basler             # or zelux / hayear
-    python -m camera_dock.webapp zelux --host 0.0.0.0 --port 8000
+    python -m camera_dock.webapp basler                 # one camera
+    python -m camera_dock.webapp basler zelux --host 0.0.0.0 --port 8000
 
-Endpoints:
+Then open http://<host>:<port>/ — an overview of every camera's live stream, each
+linking to its full control page at /cam/<name>.
 
-    GET  /                     control page + live stream
-    GET  /stream               MJPEG (multipart/x-mixed-replace)
-    GET  /snapshot             current frame as JPEG
-    POST /snapshot/save        save current frame to captures/ (full bit depth)
-    GET  /info                 JSON: model, serial, size, acquisition fps
-    GET  /controls             JSON: all values, ranges, capabilities, rec state
-    POST /controls/exposure?value=US
-    POST /controls/gain?value=G
-    POST /controls/fps?value=FPS
-    POST /controls/roi?x=&y=&w=&h=     (blocked while recording)
-    POST /controls/roi/reset
+Per-camera endpoints (prefix ``/cam/{name}``):
+
+    GET  /stream      MJPEG (multipart/x-mixed-replace)
+    GET  /snapshot    current frame as JPEG
+    POST /snapshot/save?fmt=tiff|png|npy
+    GET  /info        JSON: model, serial, size, acquisition fps, ok
+    GET  /controls    JSON: values, ranges, capabilities, rec state
+    POST /controls/exposure|gain|fps?value=
     POST /controls/auto_exposure
-    POST /record/start
-    POST /record/stop          -> encode stats
+    POST /controls/roi?x=&y=&w=&h=   ·   /controls/roi/reset   (blocked while recording)
+    POST /record/start   ·   /record/stop
 """
 
 from __future__ import annotations
@@ -61,221 +60,343 @@ def _slug(info: dict) -> str:
     return str(info.get("model", "camera")).replace(" ", "").replace("/", "-").lower()
 
 
-def create_app(camera):
-    """Build the FastAPI app that streams and controls ``camera`` (any CameraBase)."""
+class CameraSession:
+    """One camera + its acquisition engine + recording state, behind the web API."""
+
+    def __init__(self, name: str, camera) -> None:
+        self.name = name
+        self.camera = camera
+        self.engine = AcquisitionEngine(camera)
+        self.to8 = _to_8bit(8)
+        self.bit_depth = 8
+        self.has_roi = False
+        self.ok = False
+        self.error = ""
+        self.recorder: HybridRecorder | None = None
+        self.rec_path = ""
+        self.lock = threading.Lock()
+
+    # --- lifecycle ---
+    def start(self) -> None:
+        try:
+            self.camera.connect()
+            self.bit_depth = int(getattr(self.camera, "bit_depth", 8))
+            self.to8 = _to_8bit(self.bit_depth)
+            try:
+                self.camera.roi_range()
+                self.has_roi = True
+            except Exception:
+                self.has_roi = False
+            self._apply_defaults()
+            self.engine.start()
+            self.ok = True
+        except Exception as exc:               # one bad camera shouldn't sink the app
+            self.ok, self.error = False, str(exc)
+
+    def _apply_defaults(self) -> None:
+        """Sane out-of-the-box streaming settings (mirrors the preview GUI) so a
+        camera streams at a usable rate even though nothing has been set yet."""
+        try:
+            _, eh = self.camera.exposure_range()
+            self.camera.set_exposure(min(5000.0, eh))
+        except Exception:
+            pass
+        try:
+            _, fh = self.camera.frame_rate_range()
+            if fh > 0:
+                self.camera.set_frame_rate(min(30.0, fh))
+        except Exception:
+            pass
+
+    def stop(self) -> None:
+        if not self.ok:
+            return
+        try:
+            self.engine.set_sink(None)
+            self.engine.stop()
+            self.camera.disconnect()
+        except Exception:
+            pass
+
+    # --- frames ---
+    def render(self, frame: np.ndarray, *, status: bool) -> np.ndarray:
+        bgr = cv2.cvtColor(self.to8(frame), cv2.COLOR_GRAY2BGR)
+        if status:
+            cv2.putText(bgr, f"acq {self.engine.acquisition_fps:5.1f} fps   "
+                             f"exp {self.camera.get_exposure():.0f}us", (10, 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
+            if self.recorder is not None:
+                cv2.putText(bgr, f"REC {self.recorder._captured}", (bgr.shape[1] - 150, 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        imaging.draw_timestamp(bgr, imaging.eastern_now())
+        return bgr
+
+    def encode(self, frame: np.ndarray, *, status: bool) -> bytes:
+        ok, jpg = cv2.imencode(".jpg", self.render(frame, status=status),
+                               [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        return jpg.tobytes() if ok else b""
+
+    def grab_fresh(self):
+        _, start = self.engine.latest()
+        t0 = perf_counter()
+        while perf_counter() - t0 < 2.0:
+            f, i = self.engine.latest()
+            if f is not None and i >= start + 4:
+                return f
+            sleep(0.005)
+        return self.engine.latest()[0]
+
+    # --- info / controls ---
+    def info(self) -> dict:
+        di = self.camera.device_info if self.ok else {}
+        w, h = self.camera.sensor_size() if self.ok else (0, 0)
+        return {"name": self.name, "ok": self.ok, "error": self.error,
+                "model": di.get("model"), "serial": di.get("serial"),
+                "width": w, "height": h,
+                "acquisition_fps": round(self.engine.acquisition_fps, 1)}
+
+    def controls(self) -> dict:
+        c = self.camera
+        gl, gh = c.gain_range()
+        el, eh = c.exposure_range()
+        fl, fh = c.frame_rate_range()
+        return {"exposure": c.get_exposure(), "exposure_range": [el, eh],
+                "gain": c.get_gain(), "gain_range": [gl, gh], "has_gain": gh > gl,
+                "fps": c.get_frame_rate(), "fps_range": [fl, fh], "has_fps": fh > 0,
+                "roi": list(c.get_roi()) if self.has_roi else None,
+                "has_roi": self.has_roi, "sensor": list(c.sensor_size()),
+                "bit_depth": self.bit_depth, "recording": self.recorder is not None,
+                "acquisition_fps": round(self.engine.acquisition_fps, 1)}
+
+    # --- region change (stop -> set -> restart), blocked while recording ---
+    def _change_region(self, action) -> dict:
+        with self.lock:
+            if self.recorder is not None:
+                raise _Conflict("stop recording before changing ROI")
+            self.engine.stop()
+            try:
+                action()
+            finally:
+                self.engine.start()
+            return {"roi": list(self.camera.get_roi()), "sensor": list(self.camera.sensor_size())}
+
+    # --- recording ---
+    def record_start(self) -> dict:
+        with self.lock:
+            if self.recorder is not None:
+                return {"recording": True}
+            rec = HybridRecorder(clock=imaging.eastern_now)
+            self.engine.set_sink(rec.submit)
+            os.makedirs("recordings", exist_ok=True)
+            self.rec_path = datetime.now().strftime(
+                f"recordings/{_slug(self.camera.device_info)}_%Y%m%d_%H%M%S.avi")
+            self.recorder = rec
+            return {"recording": True, "path": self.rec_path}
+
+    def record_stop(self) -> dict:
+        with self.lock:
+            rec = self.recorder
+            if rec is None:
+                return {"recording": False}
+            self.engine.set_sink(None)
+            self.recorder = None
+            path = self.rec_path
+            fps = self.engine.acquisition_fps or self.camera.get_frame_rate() or 30.0
+        stats = rec.stop_and_encode(path, fps, self.to8, stamp=imaging.draw_timestamp)
+        return {"recording": False, "stats": stats}
+
+
+class _Conflict(Exception):
+    pass
+
+
+def create_app(sessions: dict):
+    """Build the FastAPI app managing all camera sessions (``{name: CameraSession}``)."""
     from contextlib import asynccontextmanager
 
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
-    engine = AcquisitionEngine(camera)
-    state = {"to8": _to_8bit(8), "bit_depth": 8, "has_roi": False,
-             "recorder": None, "rec_path": "", "lock": threading.Lock()}
-
     @asynccontextmanager
     async def lifespan(app):
-        camera.connect()
-        state["bit_depth"] = int(getattr(camera, "bit_depth", 8))
-        state["to8"] = _to_8bit(state["bit_depth"])
-        try:
-            camera.roi_range()
-            state["has_roi"] = True
-        except Exception:
-            state["has_roi"] = False
-        engine.start()
+        for s in sessions.values():
+            s.start()
         try:
             yield
         finally:
-            engine.set_sink(None)
-            engine.stop()
-            camera.disconnect()
+            for s in sessions.values():
+                s.stop()
 
     app = FastAPI(lifespan=lifespan)
 
-    # --- frame rendering / encoding ---------------------------------------
-    def render(frame: np.ndarray, *, status: bool) -> np.ndarray:
-        bgr = cv2.cvtColor(state["to8"](frame), cv2.COLOR_GRAY2BGR)
-        if status:
-            txt = f"acq {engine.acquisition_fps:5.1f} fps   exp {camera.get_exposure():.0f}us"
-            cv2.putText(bgr, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                        (0, 255, 0), 1, cv2.LINE_AA)
-            if state["recorder"] is not None:
-                cv2.putText(bgr, f"REC {state['recorder']._captured}", (bgr.shape[1] - 150, 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-        imaging.draw_timestamp(bgr, imaging.eastern_now())
-        return bgr
+    def sess(name: str) -> CameraSession:
+        s = sessions.get(name)
+        if s is None:
+            raise HTTPException(404, f"no camera '{name}'")
+        if not s.ok:
+            raise HTTPException(503, f"camera '{name}' unavailable: {s.error}")
+        return s
 
-    def encode(frame: np.ndarray, *, status: bool) -> bytes:
-        ok, jpg = cv2.imencode(".jpg", render(frame, status=status),
-                               [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        return jpg.tobytes() if ok else b""
-
-    def grab_fresh():
-        _, start = engine.latest()
-        t0 = perf_counter()
-        while perf_counter() - t0 < 2.0:
-            f, i = engine.latest()
-            if f is not None and i >= start + 4:
-                return f
-            sleep(0.005)
-        return engine.latest()[0]
-
-    # --- pages / stream ----------------------------------------------------
+    # --- overview ---
     @app.get("/")
     def index():
-        return HTMLResponse(_PAGE.format(title=camera.device_info.get("model", "camera")))
+        cards = "".join(
+            f'<div class="card"><a href="/cam/{n}"><img src="/cam/{n}/stream"></a>'
+            f'<div class="cap">{n}{"" if s.ok else " (unavailable)"}</div></div>'
+            for n, s in sessions.items())
+        return HTMLResponse(_OVERVIEW.format(cards=cards))
 
-    async def mjpeg():
-        period = 1.0 / STREAM_FPS
-        while True:
-            frame, _ = engine.latest()
-            if frame is not None:
-                jpg = encode(frame, status=True)
-                if jpg:
-                    yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                           + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
-            await asyncio.sleep(period)
+    @app.get("/cameras")
+    def cameras():
+        return [s.info() for s in sessions.values()]
 
-    @app.get("/stream")
-    def stream():
+    @app.get("/cam/{name}")
+    def cam_page(name: str):
+        s = sessions.get(name)
+        if s is None:
+            raise HTTPException(404)
+        title = (s.camera.device_info.get("model", name) if s.ok else name)
+        return HTMLResponse(_CONTROL.replace("__BASE__", f"/cam/{name}").replace("__TITLE__", title))
+
+    # --- per-camera stream / snapshot ---
+    @app.get("/cam/{name}/stream")
+    def stream(name: str):
+        s = sess(name)
+
+        async def mjpeg():
+            period = 1.0 / STREAM_FPS
+            while True:
+                frame, _ = s.engine.latest()
+                if frame is not None:
+                    # JPEG encode is CPU-bound; run it off the event loop so
+                    # concurrent streams (multi-camera) interleave fairly.
+                    jpg = await asyncio.to_thread(s.encode, frame, status=True)
+                    if jpg:
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                               + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+                await asyncio.sleep(period)
+
         return StreamingResponse(mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-    @app.get("/snapshot")
-    def snapshot():
-        frame, _ = engine.latest()
+    @app.get("/cam/{name}/snapshot")
+    def snapshot(name: str):
+        s = sess(name)
+        frame, _ = s.engine.latest()
         if frame is None:
             raise HTTPException(503, "no frame yet")
-        return Response(content=encode(frame, status=False), media_type="image/jpeg")
+        return Response(content=s.encode(frame, status=False), media_type="image/jpeg")
 
-    @app.post("/snapshot/save")
-    def snapshot_save(fmt: str = "tiff"):
-        frame, _ = engine.latest()
+    @app.post("/cam/{name}/snapshot/save")
+    def snapshot_save(name: str, fmt: str = "tiff"):
+        s = sess(name)
+        frame, _ = s.engine.latest()
         if frame is None:
             raise HTTPException(503, "no frame yet")
         os.makedirs("captures", exist_ok=True)
-        base = datetime.now().strftime(f"captures/{_slug(camera.device_info)}_%Y%m%d_%H%M%S_%f")
+        base = datetime.now().strftime(f"captures/{_slug(s.camera.device_info)}_%Y%m%d_%H%M%S_%f")
         return {"path": imaging.save_snapshot(frame, base, fmt)}
 
-    # --- info / controls ---------------------------------------------------
-    @app.get("/info")
-    def info():
-        di = camera.device_info
-        w, h = camera.sensor_size()
-        return {"model": di.get("model"), "serial": di.get("serial"),
-                "width": w, "height": h,
-                "acquisition_fps": round(engine.acquisition_fps, 1)}
+    @app.get("/cam/{name}/info")
+    def info(name: str):
+        s = sessions.get(name)
+        if s is None:
+            raise HTTPException(404)
+        return s.info()
 
-    @app.get("/controls")
-    def controls():
-        gl, gh = camera.gain_range()
-        el, eh = camera.exposure_range()
-        fl, fh = camera.frame_rate_range()
-        return {
-            "exposure": camera.get_exposure(), "exposure_range": [el, eh],
-            "gain": camera.get_gain(), "gain_range": [gl, gh], "has_gain": gh > gl,
-            "fps": camera.get_frame_rate(), "fps_range": [fl, fh], "has_fps": fh > 0,
-            "roi": list(camera.get_roi()) if state["has_roi"] else None,
-            "has_roi": state["has_roi"], "sensor": list(camera.sensor_size()),
-            "bit_depth": state["bit_depth"],
-            "recording": state["recorder"] is not None,
-            "acquisition_fps": round(engine.acquisition_fps, 1),
-        }
+    # --- per-camera controls ---
+    @app.get("/cam/{name}/controls")
+    def controls(name: str):
+        return sess(name).controls()
 
-    @app.post("/controls/exposure")
-    def set_exposure(value: float):
-        camera.set_exposure(value)
-        return {"exposure": camera.get_exposure()}
+    @app.post("/cam/{name}/controls/exposure")
+    def set_exposure(name: str, value: float):
+        c = sess(name).camera
+        c.set_exposure(value)
+        return {"exposure": c.get_exposure()}
 
-    @app.post("/controls/gain")
-    def set_gain(value: float):
-        camera.set_gain(value)
-        return {"gain": camera.get_gain()}
+    @app.post("/cam/{name}/controls/gain")
+    def set_gain(name: str, value: float):
+        c = sess(name).camera
+        c.set_gain(value)
+        return {"gain": c.get_gain()}
 
-    @app.post("/controls/fps")
-    def set_fps(value: float):
-        camera.set_frame_rate(value)
-        return {"fps": camera.get_frame_rate()}
+    @app.post("/cam/{name}/controls/fps")
+    def set_fps(name: str, value: float):
+        c = sess(name).camera
+        c.set_frame_rate(value)
+        return {"fps": c.get_frame_rate()}
 
-    @app.post("/controls/auto_exposure")
-    def auto_exposure():
-        return {"exposure": imaging.auto_expose(camera, grab_fresh)}
+    @app.post("/cam/{name}/controls/auto_exposure")
+    def auto_exposure(name: str):
+        s = sess(name)
+        return {"exposure": imaging.auto_expose(s.camera, s.grab_fresh)}
 
-    @app.post("/controls/roi")
-    def set_roi(x: int, y: int, w: int, h: int):
-        if not state["has_roi"]:
+    @app.post("/cam/{name}/controls/roi")
+    def set_roi(name: str, x: int, y: int, w: int, h: int):
+        s = sess(name)
+        if not s.has_roi:
             raise HTTPException(400, "ROI not supported")
-        with state["lock"]:
-            if state["recorder"] is not None:
-                raise HTTPException(409, "stop recording before changing ROI")
-            engine.stop()
-            try:
-                camera.set_roi(x, y, w, h)
-            finally:
-                engine.start()
-            return {"roi": list(camera.get_roi()), "sensor": list(camera.sensor_size())}
+        try:
+            return s._change_region(lambda: s.camera.set_roi(x, y, w, h))
+        except _Conflict as exc:
+            raise HTTPException(409, str(exc))
 
-    @app.post("/controls/roi/reset")
-    def reset_roi():
-        if not state["has_roi"]:
+    @app.post("/cam/{name}/controls/roi/reset")
+    def reset_roi(name: str):
+        s = sess(name)
+        if not s.has_roi:
             raise HTTPException(400, "ROI not supported")
-        with state["lock"]:
-            if state["recorder"] is not None:
-                raise HTTPException(409, "stop recording before changing ROI")
-            engine.stop()
-            try:
-                camera.reset_roi()
-            finally:
-                engine.start()
-            return {"roi": list(camera.get_roi()), "sensor": list(camera.sensor_size())}
+        try:
+            return s._change_region(s.camera.reset_roi)
+        except _Conflict as exc:
+            raise HTTPException(409, str(exc))
 
-    # --- recording ---------------------------------------------------------
-    @app.post("/record/start")
-    def record_start():
-        with state["lock"]:
-            if state["recorder"] is not None:
-                return {"recording": True}
-            rec = HybridRecorder(clock=imaging.eastern_now)
-            engine.set_sink(rec.submit)
-            os.makedirs("recordings", exist_ok=True)
-            state["rec_path"] = datetime.now().strftime(
-                f"recordings/{_slug(camera.device_info)}_%Y%m%d_%H%M%S.avi")
-            state["recorder"] = rec
-            return {"recording": True, "path": state["rec_path"]}
+    # --- per-camera recording ---
+    @app.post("/cam/{name}/record/start")
+    def record_start(name: str):
+        return sess(name).record_start()
 
-    @app.post("/record/stop")
-    def record_stop():
-        with state["lock"]:
-            rec = state["recorder"]
-            if rec is None:
-                return {"recording": False}
-            engine.set_sink(None)
-            state["recorder"] = None
-            path, fps = state["rec_path"], engine.acquisition_fps or camera.get_frame_rate() or 30.0
-        stats = rec.stop_and_encode(path, fps, state["to8"], stamp=imaging.draw_timestamp)
-        return {"recording": False, "stats": stats}
+    @app.post("/cam/{name}/record/stop")
+    def record_stop(name: str):
+        return sess(name).record_stop()
 
     return app
 
 
-_PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>{title}</title>
+_OVERVIEW = """<!doctype html>
+<html><head><meta charset="utf-8"><title>xsphere camera dock</title>
 <style>
-  body {{ margin:0; background:#111; color:#ddd; font-family:system-ui,sans-serif; font-size:14px; }}
-  header {{ padding:8px 14px; background:#000; }} #info {{ color:#7f7; }}
-  .main {{ display:flex; flex-wrap:wrap; gap:14px; padding:12px; }}
-  .stream img {{ max-width:70vw; height:auto; border:1px solid #333; }}
-  .panel {{ min-width:280px; background:#1a1a1a; border:1px solid #333; border-radius:6px; padding:12px; }}
-  .row {{ margin:10px 0; }} label {{ display:block; margin-bottom:3px; color:#aaa; }}
-  input[type=range] {{ width:100%; }} input[type=text] {{ width:140px; background:#222; color:#ddd; border:1px solid #444; }}
-  .val {{ color:#7cf; float:right; }}
-  button {{ background:#264; color:#dfd; border:1px solid #486; border-radius:4px; padding:6px 10px; cursor:pointer; }}
-  button:hover {{ background:#386; }} button.rec {{ background:#622; color:#fdd; border-color:#a55; }}
-  #stat {{ color:#fc7; margin-top:8px; min-height:1.2em; }}
+  body {{ margin:0; background:#111; color:#ddd; font-family:system-ui,sans-serif; }}
+  header {{ padding:10px 16px; background:#000; font-size:16px; }}
+  .grid {{ display:flex; flex-wrap:wrap; gap:14px; padding:14px; }}
+  .card {{ background:#1a1a1a; border:1px solid #333; border-radius:6px; padding:8px; }}
+  .card img {{ display:block; max-width:46vw; height:auto; border:1px solid #333; }}
+  .cap {{ text-align:center; padding-top:6px; color:#7cf; }}
+  a {{ color:inherit; text-decoration:none; }}
+</style></head>
+<body><header><b>xsphere camera dock</b> &mdash; live streams</header>
+<div class="grid">{cards}</div></body></html>"""
+
+
+_CONTROL = """<!doctype html>
+<html><head><meta charset="utf-8"><title>__TITLE__</title>
+<style>
+  body { margin:0; background:#111; color:#ddd; font-family:system-ui,sans-serif; font-size:14px; }
+  header { padding:8px 14px; background:#000; } #info { color:#7f7; } a { color:#8cf; }
+  .main { display:flex; flex-wrap:wrap; gap:14px; padding:12px; }
+  .stream img { max-width:70vw; height:auto; border:1px solid #333; }
+  .panel { min-width:280px; background:#1a1a1a; border:1px solid #333; border-radius:6px; padding:12px; }
+  .row { margin:10px 0; } label { display:block; margin-bottom:3px; color:#aaa; }
+  input[type=range] { width:100%; } input[type=text] { width:140px; background:#222; color:#ddd; border:1px solid #444; }
+  .val { color:#7cf; float:right; }
+  button { background:#264; color:#dfd; border:1px solid #486; border-radius:4px; padding:6px 10px; cursor:pointer; }
+  button:hover { background:#386; } button.rec { background:#622; color:#fdd; border-color:#a55; }
+  #stat { color:#fc7; margin-top:8px; min-height:1.2em; }
 </style></head>
 <body>
-  <header><b>{title}</b> &mdash; <span id="info">connecting…</span></header>
+  <header><a href="/">&larr; all cameras</a> &nbsp; <b>__TITLE__</b> &mdash; <span id="info">connecting…</span></header>
   <div class="main">
-    <div class="stream"><img src="/stream" alt="camera stream"></div>
+    <div class="stream"><img src="__BASE__/stream" alt="camera stream"></div>
     <div class="panel">
       <div class="row" id="exp-row"><label>exposure (us) <span class="val" id="exp-v"></span></label>
         <input type="range" id="exp" min="0" max="1000"></div>
@@ -293,49 +414,38 @@ _PAGE = """<!doctype html>
     </div>
   </div>
 <script>
-let R={{}}, rec=false;
-const $=id=>document.getElementById(id);
+const BASE="__BASE__"; let R={}, rec=false; const $=id=>document.getElementById(id);
 const geom=(lo,hi,f)=>lo*Math.pow(hi/Math.max(lo,1e-6),f);
 const geomFrac=(lo,hi,v)=>Math.log(Math.max(v,lo)/Math.max(lo,1e-6))/Math.log(hi/Math.max(lo,1e-6));
-async function post(u){{return (await fetch(u,{{method:'POST'}})).json();}}
-function bindGeom(id,lo,hi,val,name,fmt){{
-  const s=$(id); s.value=Math.round(geomFrac(lo,hi,val)*1000);
+async function post(u){return (await fetch(BASE+u,{method:'POST'})).json();}
+function bindGeom(id,lo,hi,val,name,fmt){const s=$(id); s.value=Math.round(geomFrac(lo,hi,val)*1000);
   $(id+'-v').textContent=fmt(val);
-  s.oninput=async()=>{{const v=geom(lo,hi,s.value/1000); $(id+'-v').textContent=fmt(v);
-    const r=await post('/controls/'+name+'?value='+v); $(id+'-v').textContent=fmt(r[name]);}};
-}}
-function bindLin(id,lo,hi,val,name,fmt){{
-  const s=$(id); s.value=Math.round((val-lo)/(hi-lo)*1000);
+  s.oninput=async()=>{const v=geom(lo,hi,s.value/1000); $(id+'-v').textContent=fmt(v);
+    const r=await post('/controls/'+name+'?value='+v); $(id+'-v').textContent=fmt(r[name]);};}
+function bindLin(id,lo,hi,val,name,fmt){const s=$(id); s.value=Math.round((val-lo)/(hi-lo)*1000);
   $(id+'-v').textContent=fmt(val);
-  s.oninput=async()=>{{const v=lo+(hi-lo)*s.value/1000; $(id+'-v').textContent=fmt(v);
-    const r=await post('/controls/'+name+'?value='+v); $(id+'-v').textContent=fmt(r[name]);}};
-}}
-async function load(){{
-  R=await (await fetch('/controls')).json();
+  s.oninput=async()=>{const v=lo+(hi-lo)*s.value/1000; $(id+'-v').textContent=fmt(v);
+    const r=await post('/controls/'+name+'?value='+v); $(id+'-v').textContent=fmt(r[name]);};}
+async function load(){R=await (await fetch(BASE+'/controls')).json();
   bindGeom('exp',R.exposure_range[0],R.exposure_range[1],R.exposure,'exposure',v=>v.toFixed(0));
-  if(R.has_gain) bindLin('gain',R.gain_range[0],R.gain_range[1],R.gain,'gain',v=>v.toFixed(1));
-  else $('gain-row').style.display='none';
-  if(R.has_fps) bindLin('fps',R.fps_range[0],R.fps_range[1],R.fps,'fps',v=>v.toFixed(1));
-  else $('fps-row').style.display='none';
+  if(R.has_gain) bindLin('gain',R.gain_range[0],R.gain_range[1],R.gain,'gain',v=>v.toFixed(1)); else $('gain-row').style.display='none';
+  if(R.has_fps) bindLin('fps',R.fps_range[0],R.fps_range[1],R.fps,'fps',v=>v.toFixed(1)); else $('fps-row').style.display='none';
   if(R.has_roi) $('roi').value=R.roi.join(','); else $('roi-row').style.display='none';
-  setRec(R.recording);
-}}
-async function autoExp(){{$('stat').textContent='auto-exposing…'; const r=await post('/controls/auto_exposure');
-  $('stat').textContent='exposure → '+r.exposure.toFixed(0)+' us'; load();}}
-async function save(){{const r=await post('/snapshot/save'); $('stat').textContent='snapshot → '+r.path;}}
-async function setRoi(){{const p=$('roi').value.split(',').map(Number); if(p.length!==4) return;
-  const r=await fetch(`/controls/roi?x=${{p[0]}}&y=${{p[1]}}&w=${{p[2]}}&h=${{p[3]}}`,{{method:'POST'}});
-  const j=await r.json(); $('stat').textContent = r.ok?('ROI → '+j.roi.join(',')):('ROI: '+(j.detail||'error'));}}
-async function resetRoi(){{const j=await post('/controls/roi/reset'); $('roi').value=j.roi.join(','); $('stat').textContent='ROI → full';}}
-function setRec(on){{rec=on; $('rec').textContent=on?'■ stop':'● record'; $('rec').style.background=on?'#a33':'#622';}}
-async function toggleRec(){{
-  if(!rec){{const r=await post('/record/start'); setRec(true); $('stat').textContent='recording → '+r.path;}}
-  else{{$('stat').textContent='encoding…'; const r=await post('/record/stop'); setRec(false);
-    const s=r.stats; $('stat').textContent=`saved ${{s.path}} (${{s.encoded}} frames @ ${{s.capture_fps}} fps, dropped ${{s.dropped}})`;}}
-}}
-async function poll(){{try{{const j=await (await fetch('/info')).json();
-  $('info').textContent=`${{j.model}} s/n ${{j.serial}} · ${{j.width}}x${{j.height}} · acq ${{j.acquisition_fps.toFixed(1)}} fps`;}}catch(e){{}}
-  setTimeout(poll,1000);}}
+  setRec(R.recording);}
+async function autoExp(){$('stat').textContent='auto-exposing…'; const r=await post('/controls/auto_exposure');
+  $('stat').textContent='exposure → '+r.exposure.toFixed(0)+' us'; load();}
+async function save(){const r=await post('/snapshot/save'); $('stat').textContent='snapshot → '+r.path;}
+async function setRoi(){const p=$('roi').value.split(',').map(Number); if(p.length!==4) return;
+  const r=await fetch(`${BASE}/controls/roi?x=${p[0]}&y=${p[1]}&w=${p[2]}&h=${p[3]}`,{method:'POST'}); const j=await r.json();
+  $('stat').textContent = r.ok?('ROI → '+j.roi.join(',')):('ROI: '+(j.detail||'error'));}
+async function resetRoi(){const j=await post('/controls/roi/reset'); $('roi').value=j.roi.join(','); $('stat').textContent='ROI → full';}
+function setRec(on){rec=on; $('rec').textContent=on?'■ stop':'● record'; $('rec').style.background=on?'#a33':'#622';}
+async function toggleRec(){if(!rec){const r=await post('/record/start'); setRec(true); $('stat').textContent='recording → '+r.path;}
+  else{$('stat').textContent='encoding…'; const r=await post('/record/stop'); setRec(false); const s=r.stats;
+    $('stat').textContent=`saved ${s.path} (${s.encoded} frames @ ${s.capture_fps} fps, dropped ${s.dropped})`;}}
+async function poll(){try{const j=await (await fetch(BASE+'/info')).json();
+  $('info').textContent=`${j.model} s/n ${j.serial} · ${j.width}x${j.height} · acq ${j.acquisition_fps.toFixed(1)} fps`;}catch(e){}
+  setTimeout(poll,1000);}
 load(); poll();
 </script>
 </body></html>"""
@@ -356,18 +466,20 @@ def _make_camera(name: str):
     return getattr(__import__(pkg), cls)()
 
 
-def serve(camera, host: str = "127.0.0.1", port: int = 8000) -> None:
+def serve(sessions: dict, host: str = "127.0.0.1", port: int = 8000) -> None:
     import uvicorn
-    uvicorn.run(create_app(camera), host=host, port=port)
+    uvicorn.run(create_app(sessions), host=host, port=port)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Stream and control a camera over the web.")
-    parser.add_argument("camera", choices=["basler", "zelux", "hayear"])
+    parser = argparse.ArgumentParser(description="Stream and control cameras over the web.")
+    parser.add_argument("cameras", nargs="+", choices=["basler", "zelux", "hayear"],
+                        help="one or more cameras to serve")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
-    serve(_make_camera(args.camera), host=args.host, port=args.port)
+    sessions = {name: CameraSession(name, _make_camera(name)) for name in args.cameras}
+    serve(sessions, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
