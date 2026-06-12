@@ -40,6 +40,9 @@ from time import perf_counter, sleep
 
 import cv2
 import numpy as np
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from . import imaging, presets
 from .engine import AcquisitionEngine
@@ -233,24 +236,34 @@ class _Conflict(Exception):
     pass
 
 
-def create_app(sessions: dict):
-    """Build the FastAPI app managing all camera sessions (``{name: CameraSession}``)."""
-    from contextlib import asynccontextmanager
+def start_all(sessions: dict) -> None:
+    """Connect + start every session (for a parent app that manages the lifecycle)."""
+    for s in sessions.values():
+        s.start()
 
-    from fastapi import FastAPI, HTTPException
-    from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
+def stop_all(sessions: dict) -> None:
+    for s in sessions.values():
+        s.stop()
+
+
+def create_app(sessions: dict, *, manage_lifecycle: bool = True):
+    """Build the FastAPI app managing all camera sessions (``{name: CameraSession}``).
+
+    ``manage_lifecycle=False`` skips the startup/shutdown lifespan so the app can be
+    mounted as a sub-application of a parent that starts/stops the sessions itself
+    (see :mod:`xsphere_daq.panel`). HTML links honour the mount prefix (root_path),
+    so it works both standalone and mounted under e.g. ``/cameras``.
+    """
     @asynccontextmanager
     async def lifespan(app):
-        for s in sessions.values():
-            s.start()
+        start_all(sessions)
         try:
             yield
         finally:
-            for s in sessions.values():
-                s.stop()
+            stop_all(sessions)
 
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(lifespan=lifespan) if manage_lifecycle else FastAPI()
 
     def sess(name: str) -> CameraSession:
         s = sessions.get(name)
@@ -262,9 +275,10 @@ def create_app(sessions: dict):
 
     # --- overview ---
     @app.get("/")
-    def index():
+    def index(request: Request):
+        p = request.scope.get("root_path", "")          # mount prefix, if any
         cards = "".join(
-            f'<div class="card"><a href="/cam/{n}"><img src="/cam/{n}/stream"></a>'
+            f'<div class="card"><a href="{p}/cam/{n}"><img src="{p}/cam/{n}/stream"></a>'
             f'<div class="cap">{n}{"" if s.ok else " (unavailable)"}</div></div>'
             for n, s in sessions.items())
         return HTMLResponse(_OVERVIEW.format(cards=cards))
@@ -274,12 +288,14 @@ def create_app(sessions: dict):
         return [s.info() for s in sessions.values()]
 
     @app.get("/cam/{name}")
-    def cam_page(name: str):
+    def cam_page(request: Request, name: str):
         s = sessions.get(name)
         if s is None:
             raise HTTPException(404)
         title = (s.camera.device_info.get("model", name) if s.ok else name)
-        return HTMLResponse(_CONTROL.replace("__BASE__", f"/cam/{name}").replace("__TITLE__", title))
+        root = request.scope.get("root_path", "")
+        return HTMLResponse(_CONTROL.replace("__BASE__", root + f"/cam/{name}")
+                            .replace("__ROOT__", root).replace("__TITLE__", title))
 
     # --- per-camera stream / snapshot ---
     @app.get("/cam/{name}/stream")
@@ -436,7 +452,7 @@ _CONTROL = """<!doctype html>
   #stat { color:#fc7; margin-top:8px; min-height:1.2em; }
 </style></head>
 <body>
-  <header><a href="/">&larr; all cameras</a> &nbsp; <b>__TITLE__</b> &mdash; <span id="info">connecting…</span></header>
+  <header><a href="__ROOT__/">&larr; all cameras</a> &nbsp; <b>__TITLE__</b> &mdash; <span id="info">connecting…</span></header>
   <div class="main">
     <div class="stream"><img src="__BASE__/stream" alt="camera stream"></div>
     <div class="panel">

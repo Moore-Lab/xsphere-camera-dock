@@ -13,6 +13,25 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-06-12 — webapp: mountable as a sub-application
+
+**Context.** Make the camera app mountable under a path prefix so the top-level
+`xsphere_daq` panel can host it at `/cameras` (see the top repo's log).
+
+- `create_app(sessions, manage_lifecycle=True)` — `False` skips the lifespan so a parent
+  app manages startup/shutdown. Added `start_all` / `stop_all` helpers for the parent.
+- HTML links are now **root_path-aware**: the overview cards, the control page `BASE`,
+  and the "all cameras" back-link prefix with `request.scope["root_path"]`, so the app
+  works both standalone (prefix "") and mounted (e.g. "/cameras").
+- **Bug fixed:** moved the FastAPI imports to module top. With `from __future__ import
+  annotations`, the `request: Request` annotation is a string FastAPI resolves against
+  module globals — where `Request` wasn't imported (it was local to `create_app`), so
+  FastAPI treated `request` as a required query param and the overview/control pages
+  500'd. Module-level import fixes resolution.
+
+**Validated** via the top-level panel (mounted under /cameras): overview cards, control
+page BASE, info/controls/stream all correctly prefixed and working.
+
 ## 2026-06-12 — Dock web app: settings presets
 
 **Context.** Make camera setups reproducible across restarts (important for the
