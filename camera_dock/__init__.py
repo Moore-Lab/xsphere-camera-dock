@@ -6,5 +6,8 @@ The shared interface every camera module is expected to implement lives in
 """
 
 from .base import CameraBase
+from .engine import AcquisitionEngine
+from .recorder import HybridRecorder
+from . import preview
 
-__all__ = ["CameraBase"]
+__all__ = ["CameraBase", "AcquisitionEngine", "HybridRecorder", "preview"]
