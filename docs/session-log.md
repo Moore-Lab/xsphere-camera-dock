@@ -13,6 +13,30 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-06-12 — Web app: per-camera connect / disconnect at runtime
+
+**Context.** User needs to release a camera from the dock at runtime (to hand it to the
+GUI / ThorCam / Pylon Viewer) and re-acquire it, without restarting the server.
+
+- `CameraSession.start()` is now idempotent (no-op if connected) and `stop()` fully
+  releases (stops engine + `camera.disconnect()` + clears recorder + `ok=False`), so both
+  can be driven at runtime.
+- Endpoints `POST /cam/{name}/connect` and `POST /cam/{name}/disconnect` (disconnect is
+  409 while recording). While released, the camera's other endpoints 503; `/info` and
+  `/connect`/`/disconnect` still work.
+- Control page: a **connect/disconnect button** in the header (label tracks live state
+  via `/info`); on toggle it POSTs and reloads to re-establish the stream/controls. The
+  page degrades gracefully when the camera is released (controls skip binding).
+
+**Validated on the Zelux:** disconnect → `ok=False`, `/controls` returns 503 (camera
+released); connect → `ok=True`, stream resumes. Confirms a camera can be freed for
+another client and re-acquired live.
+
+**Incident:** the Hayear HY-1136 (cheap UVC, RDP-redirected) dropped off the USB bus
+during rapid connect/disconnect/force-kill test cycles — it stopped enumerating in
+DirectShow/PnP and needs a physical replug. Lesson: UVC cameras don't tolerate fast
+open/close churn well; the SDK cameras (Basler/Zelux) do.
+
 ## 2026-06-12 — Hayear HY-1136 (UVC) + has_exposure gating
 
 **Context.** The connected Hayear (HY-1136) turned out to be a **UVC webcam-class colour

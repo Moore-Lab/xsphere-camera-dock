@@ -79,8 +79,10 @@ class CameraSession:
         self.rec_path = ""
         self.lock = threading.Lock()
 
-    # --- lifecycle ---
+    # --- lifecycle (also driven at runtime by /connect and /disconnect) ---
     def start(self) -> None:
+        if self.ok:
+            return
         try:
             self.camera.connect()
             self.bit_depth = int(getattr(self.camera, "bit_depth", 8))
@@ -119,14 +121,16 @@ class CameraSession:
             pass
 
     def stop(self) -> None:
+        """Release the camera (stop engine + disconnect) — frees it for other clients."""
         if not self.ok:
             return
         try:
             self.engine.set_sink(None)
+            self.recorder = None
             self.engine.stop()
             self.camera.disconnect()
-        except Exception:
-            pass
+        finally:
+            self.ok = False
 
     # --- frames ---
     def render(self, frame: np.ndarray, *, status: bool) -> np.ndarray:
@@ -343,6 +347,26 @@ def create_app(sessions: dict, *, manage_lifecycle: bool = True):
             raise HTTPException(404)
         return s.info()
 
+    @app.post("/cam/{name}/connect")
+    def cam_connect(name: str):
+        s = sessions.get(name)
+        if s is None:
+            raise HTTPException(404)
+        s.start()                       # idempotent: no-op if already connected
+        if not s.ok:
+            raise HTTPException(503, s.error or "failed to connect")
+        return {"connected": True}
+
+    @app.post("/cam/{name}/disconnect")
+    def cam_disconnect(name: str):
+        s = sessions.get(name)
+        if s is None:
+            raise HTTPException(404)
+        if s.recorder is not None:
+            raise HTTPException(409, "stop recording before disconnecting")
+        s.stop()                        # releases the camera for other clients
+        return {"connected": False}
+
     # --- per-camera controls ---
     @app.get("/cam/{name}/controls")
     def controls(name: str):
@@ -453,7 +477,8 @@ _CONTROL = """<!doctype html>
   #stat { color:#fc7; margin-top:8px; min-height:1.2em; }
 </style></head>
 <body>
-  <header><a href="__ROOT__/">&larr; all cameras</a> &nbsp; <b>__TITLE__</b> &mdash; <span id="info">connecting…</span></header>
+  <header><a href="__ROOT__/">&larr; all cameras</a> &nbsp; <b>__TITLE__</b> &mdash; <span id="info">connecting…</span>
+    &nbsp; <button id="conn" onclick="toggleConn()">disconnect</button></header>
   <div class="main">
     <div class="stream"><img src="__BASE__/stream" alt="camera stream"></div>
     <div class="panel">
@@ -488,7 +513,9 @@ function bindLin(id,lo,hi,val,name,fmt){const s=$(id); s.value=Math.round((val-l
   $(id+'-v').textContent=fmt(val);
   s.oninput=async()=>{const v=lo+(hi-lo)*s.value/1000; $(id+'-v').textContent=fmt(v);
     const r=await post('/controls/'+name+'?value='+v); $(id+'-v').textContent=fmt(r[name]);};}
-async function load(){R=await (await fetch(BASE+'/controls')).json();
+async function load(){let resp;
+  try{ resp=await fetch(BASE+'/controls'); if(!resp.ok) throw 0; R=await resp.json(); }
+  catch(e){ return; }   // camera disconnected — skip control binding
   if(R.has_exposure) bindGeom('exp',R.exposure_range[0],R.exposure_range[1],R.exposure,'exposure',v=>v.toFixed(0));
   else { $('exp-row').style.display='none'; $('autoexp').style.display='none'; }
   if(R.has_gain) bindLin('gain',R.gain_range[0],R.gain_range[1],R.gain,'gain',v=>v.toFixed(1)); else $('gain-row').style.display='none';
@@ -514,9 +541,18 @@ function setRec(on){rec=on; $('rec').textContent=on?'■ stop':'● record'; $('
 async function toggleRec(){if(!rec){const r=await post('/record/start'); setRec(true); $('stat').textContent='recording → '+r.path;}
   else{$('stat').textContent='encoding…'; const r=await post('/record/stop'); setRec(false); const s=r.stats;
     $('stat').textContent=`saved ${s.path} (${s.encoded} frames @ ${s.capture_fps} fps, dropped ${s.dropped})`;}}
+async function toggleConn(){
+  let j={}; try{ j=await (await fetch(BASE+'/info')).json(); }catch(e){}
+  const ep = j.ok ? '/disconnect' : '/connect';
+  $('stat').textContent = j.ok ? 'disconnecting (freeing camera)…' : 'connecting…';
+  const r = await fetch(BASE+ep, {method:'POST'});
+  if(!r.ok){ const e=await r.json().catch(()=>({})); $('stat').textContent='error: '+(e.detail||r.status); return; }
+  setTimeout(()=>location.reload(), 500);   // re-establish stream + controls
+}
 async function poll(){try{const j=await (await fetch(BASE+'/info')).json();
-  $('info').textContent=`${j.model} s/n ${j.serial} · ${j.width}x${j.height} · acq ${j.acquisition_fps.toFixed(1)} fps`;}catch(e){}
-  setTimeout(poll,1000);}
+  if(j.ok){ $('info').textContent=`${j.model} s/n ${j.serial} · ${j.width}x${j.height} · acq ${j.acquisition_fps.toFixed(1)} fps`; $('conn').textContent='disconnect'; }
+  else { $('info').textContent='disconnected'+(j.error?(' · '+j.error):''); $('conn').textContent='connect'; }
+}catch(e){} setTimeout(poll,1000);}
 load(); poll();
 </script>
 </body></html>"""
