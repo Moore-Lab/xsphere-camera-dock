@@ -1,0 +1,6 @@
+# NOTE: pyueye is only bindings — the IDS Software Suite (uEye driver, provides
+# ueye_api.dll) must be installed separately from ids-imaging.com.
+pyueye
+numpy
+# Native test GUI + image/video I/O (OpenCV highgui, no Qt dependency)
+opencv-python

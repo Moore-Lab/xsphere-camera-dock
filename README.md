@@ -13,6 +13,7 @@ the broader data-acquisition / experiment-control project.
 |------|--------|------|
 | `basler-acA1440` | Basler acA1440-220um | [Moore-Lab/basler-acA1440](https://github.com/Moore-Lab/basler-acA1440) |
 | `zelux-cs165mu`  | Thorlabs Zelux CS165MU | [Moore-Lab/zelux-cs165mu](https://github.com/Moore-Lab/zelux-cs165mu) |
+| `ids-ueye`       | IDS uEye (e.g. DCC1545M-GL) | local module (not yet a submodule) |
 
 Each camera module exposes the same conceptual driver interface
 (`connect` / `set_exposure` / `set_frame_rate` / `grab` / `frames`), so the dock can

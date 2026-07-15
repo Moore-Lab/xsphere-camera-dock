@@ -100,10 +100,10 @@ def run(camera, *, title: str | None = None, fps_cap: float | None = None,
         bx_max = by_max = 1
     has_binning = max(bx_max, by_max) > 1
 
+    if has_fps:                       # fps first: exposure range can depend on it
+        camera.set_frame_rate(min(fps_top, fps_hi))
     if has_exposure:
         camera.set_exposure(min(5000.0, exp_hi))
-    if has_fps:
-        camera.set_frame_rate(min(fps_top, fps_hi))
 
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window, 960, 780)

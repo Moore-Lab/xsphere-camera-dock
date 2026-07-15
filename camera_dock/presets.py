@@ -40,8 +40,15 @@ def apply(camera, settings: dict, *, set_roi: bool = True) -> None:
     """Apply a settings dict to ``camera`` (best-effort; unsupported keys ignored).
 
     ``set_roi=False`` skips the ROI (the caller may need to stop acquisition first;
-    see the web app's region-change path). Binning is applied before ROI.
+    see the web app's region-change path). Binning is applied before ROI. Frame
+    rate is applied before exposure: on cameras whose exposure range depends on
+    the frame period (IDS uEye), the reverse order clamps long exposures.
     """
+    if "fps" in settings:
+        try:
+            camera.set_frame_rate(float(settings["fps"]))
+        except Exception:
+            pass
     if "exposure" in settings:
         try:
             camera.set_exposure(float(settings["exposure"]))
@@ -50,11 +57,6 @@ def apply(camera, settings: dict, *, set_roi: bool = True) -> None:
     if "gain" in settings:
         try:
             camera.set_gain(float(settings["gain"]))
-        except Exception:
-            pass
-    if "fps" in settings:
-        try:
-            camera.set_frame_rate(float(settings["fps"]))
         except Exception:
             pass
     if settings.get("binning"):

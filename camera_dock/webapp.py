@@ -107,16 +107,17 @@ class CameraSession:
 
     def _apply_defaults(self) -> None:
         """Sane out-of-the-box streaming settings (mirrors the preview GUI) so a
-        camera streams at a usable rate even though nothing has been set yet."""
-        try:
-            _, eh = self.camera.exposure_range()
-            self.camera.set_exposure(min(5000.0, eh))
-        except Exception:
-            pass
+        camera streams at a usable rate even though nothing has been set yet.
+        Frame rate first: the exposure range can depend on the frame period."""
         try:
             _, fh = self.camera.frame_rate_range()
             if fh > 0:
                 self.camera.set_frame_rate(min(30.0, fh))
+        except Exception:
+            pass
+        try:
+            _, eh = self.camera.exposure_range()
+            self.camera.set_exposure(min(5000.0, eh))
         except Exception:
             pass
 
@@ -565,6 +566,7 @@ def _make_camera(name: str):
         "basler": ("basler-acA1440", "basler_acA1440", "BaslerACA1440"),
         "zelux": ("zelux-cs165mu", "zelux_cs165mu", "ZeluxCS165MU"),
         "hayear": ("hayear", "hayear", "HayearCamera"),
+        "ids": ("ids-ueye", "ids_ueye", "IDSUEye"),
     }
     if name not in table:
         raise SystemExit(f"Unknown camera '{name}'. Choose from: {', '.join(table)}")
@@ -580,7 +582,7 @@ def serve(sessions: dict, host: str = "127.0.0.1", port: int = 8000) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stream and control cameras over the web.")
-    parser.add_argument("cameras", nargs="+", choices=["basler", "zelux", "hayear"],
+    parser.add_argument("cameras", nargs="+", choices=["basler", "zelux", "hayear", "ids"],
                         help="one or more cameras to serve")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)

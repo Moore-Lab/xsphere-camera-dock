@@ -62,15 +62,22 @@ class AcquisitionEngine:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop acquisition and join the background thread."""
+        """Stop acquisition and join the background thread.
+
+        The camera is stopped *before* the join (mirroring the tested reference
+        GUIs' disarm-first discipline): stopping aborts a grab blocked inside
+        the SDK, so the thread exits within one poll chunk instead of waiting
+        out a full frame period — without this, a slow frame rate makes the
+        join time out and the thread outlive the engine.
+        """
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
         try:
             self._cam.stop()
         except Exception:
             pass
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            self._thread = None
 
     def _loop(self) -> None:
         window_n, window_t0 = 0, perf_counter()
