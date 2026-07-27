@@ -1,7 +1,8 @@
 # ids-ueye
 
-Driver + test GUI for IDS uEye cameras (e.g. DCC1545M-GL, USB2 mono) for the
-[xsphere-camera-dock](../README.md).
+Driver + test GUI for IDS uEye cameras — **including the older Thorlabs
+DCC/DCx-series cameras (DCC1545M, DCC1240, DCC3240, ...), which are rebranded
+IDS uEye hardware** — for the [xsphere-camera-dock](../README.md).
 
 The capture core is a port of the hardware-tested `IDSCamera` adapter from the
 lab's PyQt dual-camera GUI (`reference/dualcam_fast.py`, validated at 200 fps):
@@ -12,9 +13,19 @@ and web app drive it like any other camera.
 
 ## Install
 
-1. Install the [IDS Software Suite](https://en.ids-imaging.com/downloads.html)
-   (uEye driver — provides `ueye_api.dll`).
+1. Install ONE driver stack:
+   - **IDS cameras**: the [IDS Software Suite](https://en.ids-imaging.com/downloads.html)
+     (provides `ueye_api.dll`), or
+   - **Thorlabs DCC/DCx cameras**: ThorCam with "DCx Camera Support"
+     (provides `uc480_64.dll` — same SDK, renamed). The driver detects which
+     one is present automatically; set `THORLABS_UC480_DIR` only if ThorCam is
+     installed somewhere non-standard.
 2. `pip install -r requirements.txt`
+
+The Thorlabs uc480 DLL predates `is_WaitEvent`, so on that stack the driver
+automatically switches to the classic event mechanism (`is_InitEvent` + a
+Windows event). Which DLL a session is using is reported in `device_info`
+(`sdk_dll`, and `vendor` shows "Thorlabs (uc480)").
 
 ## Use
 
@@ -22,6 +33,10 @@ and web app drive it like any other camera.
 python smoke_test.py          # enumerate, connect, grab a burst, report rates
 python -m ids_ueye.gui        # shared OpenCV test GUI (from the dock checkout)
 python -m camera_dock.webapp ids   # web app (from the dock root)
+python -m camera_dock.webapp dcc   # same driver, named for the Thorlabs DCC
+python tests/test_driver_mock.py            # no-hardware regression (IDS mode)
+UC480_SIM=1 python tests/test_driver_mock.py   # same, Thorlabs DCC event path
+python tests/test_uc480_real.py             # binds the real ThorCam uc480 DLL
 ```
 
 ## Notes

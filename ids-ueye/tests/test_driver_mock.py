@@ -26,6 +26,13 @@ from pyueye import ueye as mock                    # the mock
 from ids_ueye import IDSUEye, list_devices
 from camera_dock.base import CameraBase
 
+# UC480_SIM=1 simulates the Thorlabs DCC/DCx driver generation: the DLL lacks
+# is_WaitEvent, so the driver must fall back to is_InitEvent + a real Windows
+# event signaled by the mock. Run the suite BOTH ways.
+if os.environ.get("UC480_SIM"):
+    mock._is_WaitEvent = None
+    print("=== uc480 simulation mode (Thorlabs DCC event path) ===")
+
 failures = []
 
 

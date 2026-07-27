@@ -1,10 +1,18 @@
-"""Driver/API for IDS uEye cameras (e.g. DCC1545M-GL, USB2, mono).
+"""Driver/API for IDS uEye cameras — including Thorlabs DCC/DCx rebrands.
 
 Wraps the IDS uEye SDK (``pyueye``) behind the same small, GUI-friendly interface
 the other camera modules expose, so that ``xsphere-camera-dock`` can drive every
 camera through identical calls (``connect`` / ``disconnect`` / ``set_exposure`` /
 ``set_frame_rate`` / ``grab`` / ``frames``). The public surface here mirrors
 ``ZeluxCS165MU`` / ``BaslerACA1440``.
+
+Thorlabs DCC/DCx cameras (DCC1545M, DCC1240, DCC3240, ...) are rebranded IDS
+uEye cameras: the ThorCam "DCx" driver stack ships the same SDK with the DLL
+renamed ``uc480(_64).dll`` and identical ``is_*`` exports. This driver therefore
+works with either stack: it first tries the genuine IDS DLL (``ueye_api``), and
+if that is absent it transparently re-binds ``pyueye`` against the Thorlabs
+``uc480`` DLL (see :func:`_import_ueye`). Set ``THORLABS_UC480_DIR`` if your
+ThorCam install lives somewhere unusual.
 
 The capture core is a port of the hardware-tested ``IDSCamera`` adapter from
 ``reference/dualcam_fast.py`` (validated at 200 fps in the PyQt dual-camera GUI):
@@ -43,6 +51,9 @@ that order for this reason). Setting a long exposure caps the achievable rate.
 from __future__ import annotations
 
 import ctypes
+import importlib.util
+import os
+import sys
 from time import perf_counter
 from typing import Iterator, List, Optional, Tuple
 
@@ -51,6 +62,77 @@ import numpy as np
 # uEye image-queue ring depth. Hardware-tested at 12 in the reference GUI: deep
 # enough to absorb host-side dequeue latency at 200 fps without dropping frames.
 IDS_RING_BUFFERS = 12
+
+# Default location of the uc480 DLL on a standard ThorCam install. The DCx
+# driver also registers uc480_64.dll in System32, which ctypes finds via PATH.
+_DEFAULT_THORCAM_DIR = r"C:\Program Files\Thorlabs\Scientific Imaging\ThorCam"
+
+
+def _import_ueye():
+    """Import ``pyueye.ueye``, falling back to the Thorlabs uc480 DLL.
+
+    ``pyueye`` hardcodes the IDS DLL names (``ueye_api_64``/``ueye_api``) in a
+    module-level ``load_dll`` call, so a machine with only the ThorCam/DCx
+    driver (Thorlabs DCC cameras) fails to import it even though the uc480 DLL
+    exports the identical API. When the plain import fails, this bootstraps the
+    package manually: load ``pyueye.dll`` standalone, widen its loader to also
+    search ``uc480_64``/``uc480`` (plus the ThorCam install directory and
+    ``THORLABS_UC480_DIR``), then execute the package init against the patched
+    loader. Genuine IDS installs are preferred — the fallback only runs when
+    the IDS DLL is absent.
+    """
+    if "pyueye.ueye" in sys.modules:
+        return sys.modules["pyueye.ueye"]
+    try:
+        from pyueye import ueye                    # normal path: IDS DLL present
+        return ueye
+    except ImportError as first_exc:
+        # pyueye not installed at all -> nothing to patch.
+        if importlib.util.find_spec("pyueye") is None:
+            raise RuntimeError(
+                "pyueye is not installed (pip install pyueye).") from first_exc
+        # Drop the partially-imported package before retrying with the patch.
+        for mod in [m for m in sys.modules if m == "pyueye" or m.startswith("pyueye.")]:
+            del sys.modules[mod]
+
+        spec = importlib.util.find_spec("pyueye")
+        pkg_dir = spec.submodule_search_locations[0]
+        dll_spec = importlib.util.spec_from_file_location(
+            "pyueye.dll", os.path.join(pkg_dir, "dll.py"))
+        dll_mod = importlib.util.module_from_spec(dll_spec)
+        sys.modules["pyueye.dll"] = dll_mod
+        dll_spec.loader.exec_module(dll_mod)
+
+        def load_dll_uc480(libinfo, libnames, envname=None):
+            names = list(libnames) + ["uc480_64", "uc480"]
+            parts = []
+            env = os.getenv(envname) if envname else None
+            if env:
+                parts.append(env)
+            thorcam = os.environ.get("THORLABS_UC480_DIR", _DEFAULT_THORCAM_DIR)
+            if os.path.isdir(thorcam):
+                parts.append(thorcam)
+            try:
+                dll = dll_mod.DLL(libinfo, names, os.pathsep.join(parts) or None)
+            except RuntimeError as exc:
+                raise ImportError(exc)
+            return dll.libfile, dll.bind_function
+
+        dll_mod.load_dll = load_dll_uc480
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["pyueye"] = pkg
+        try:
+            spec.loader.exec_module(pkg)           # runs `from . import ueye`
+        except BaseException:
+            for mod in [m for m in sys.modules if m == "pyueye" or m.startswith("pyueye.")]:
+                del sys.modules[mod]
+            raise RuntimeError(
+                "Could not load a uEye SDK DLL. For IDS cameras install the IDS "
+                "Software Suite (ueye_api.dll); for Thorlabs DCC/DCx cameras "
+                "install ThorCam with the DCx driver (uc480_64.dll) and, if it "
+                "is in a non-standard place, set THORLABS_UC480_DIR. "
+                f"Original error: {first_exc}") from first_exc
+        return sys.modules["pyueye.ueye"]
 
 
 def clamp_roi(x, y, w, h, sensor_w, sensor_h, step_x=1, step_y=1,
@@ -96,7 +178,7 @@ def list_devices() -> List[dict]:
     (empty if the SDK is unavailable or no cameras are connected).
     """
     try:
-        from pyueye import ueye
+        ueye = _import_ueye()
     except Exception:
         return []
     n = ctypes.c_int(0)
@@ -117,6 +199,93 @@ def list_devices() -> List[dict]:
             "in_use": bool(info.dwInUse),
         })
     return devices
+
+
+class _FrameEvent:
+    """Frame-ready event working on both uEye driver generations.
+
+    The IDS ``ueye_api`` DLL has ``is_WaitEvent`` (SDK-managed wait). The
+    Thorlabs ``uc480`` DLL (DCC/DCx cameras) predates it: there the application
+    creates a Windows event, registers it with ``is_InitEvent``, and waits with
+    ``WaitForSingleObject``. The flavor is detected from the pyueye binding
+    (module-level ``_is_WaitEvent`` is ``None`` when the DLL lacks the export).
+
+    ``disable``/``enable`` destroy and recreate the underlying event, so a
+    signal left over from before a stop can never satisfy the first wait after
+    a restart (same guarantee as the reference GUI's disarm sequence).
+    """
+
+    _WAIT_OBJECT_0 = 0x0
+    _WAIT_TIMEOUT = 0x102
+
+    def __init__(self, ue, hCam) -> None:
+        self._ue = ue
+        self._hCam = hCam
+        self._use_wait_event = getattr(ue, "_is_WaitEvent", True) is not None
+        self._hEvent = None
+        self.enabled = False
+
+    def enable(self) -> None:
+        if self.enabled:
+            return
+        ue = self._ue
+        if not self._use_wait_event:
+            k32 = ctypes.windll.kernel32
+            k32.CreateEventW.restype = ctypes.c_void_p
+            k32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                         ctypes.c_int, ctypes.c_void_p]
+            hEvent = k32.CreateEventW(None, 0, 0, None)   # auto-reset, unsignaled
+            if not hEvent:
+                raise RuntimeError("CreateEvent failed for the uc480 frame event")
+            ret = ue.is_InitEvent(self._hCam, ctypes.c_void_p(hEvent),
+                                  ue.IS_SET_EVENT_FRAME)
+            if ret != ue.IS_SUCCESS:
+                k32.CloseHandle(ctypes.c_void_p(hEvent))
+                raise RuntimeError(f"is_InitEvent(FRAME) failed: {ret}")
+            self._hEvent = hEvent
+        ret = ue.is_EnableEvent(self._hCam, ue.IS_SET_EVENT_FRAME)
+        if ret != ue.IS_SUCCESS:
+            self._exit_win_event()
+            raise RuntimeError(f"is_EnableEvent(FRAME) failed: {ret}")
+        self.enabled = True
+
+    def disable(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            self._ue.is_DisableEvent(self._hCam, self._ue.IS_SET_EVENT_FRAME)
+        finally:
+            self._exit_win_event()
+            self.enabled = False
+
+    def _exit_win_event(self) -> None:
+        if self._hEvent is not None:
+            try:
+                self._ue.is_ExitEvent(self._hCam, self._ue.IS_SET_EVENT_FRAME)
+            except Exception:
+                pass
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self._hEvent))
+            self._hEvent = None
+
+    def wait(self, timeout_ms: int) -> bool:
+        """``True`` when the frame event fired, ``False`` on timeout."""
+        ue = self._ue
+        if self._use_wait_event:
+            ret = ue.is_WaitEvent(self._hCam, ue.IS_SET_EVENT_FRAME, timeout_ms)
+            if ret == ue.IS_TIMED_OUT:
+                return False
+            if ret != ue.IS_SUCCESS:
+                raise RuntimeError(f"is_WaitEvent(FRAME) error: {ret}")
+            return True
+        k32 = ctypes.windll.kernel32
+        k32.WaitForSingleObject.restype = ctypes.c_uint32
+        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        r = k32.WaitForSingleObject(ctypes.c_void_p(self._hEvent), int(timeout_ms))
+        if r == self._WAIT_TIMEOUT:
+            return False
+        if r != self._WAIT_OBJECT_0:
+            raise RuntimeError(f"WaitForSingleObject(frame event) error: {r}")
+        return True
 
 
 class IDSUEye:
@@ -147,7 +316,8 @@ class IDSUEye:
         self.sensor_height_pixels = 0
         self.model = ""
         self.serial_number = ""
-        self._event_enabled = False
+        self.sdk_dll = ""                  # which DLL backs the session (set on connect)
+        self._event: Optional[_FrameEvent] = None
         self._capturing = False
         self._last_seq_num = -1
         # Last commanded frame rate; re-applied on every start() because
@@ -163,16 +333,20 @@ class IDSUEye:
     def connect(self) -> None:
         """Open the camera, set Mono8, allocate the ring, enable the frame event."""
         try:
-            from pyueye import ueye
+            ueye = _import_ueye()
+        except RuntimeError:
+            raise
         except Exception as exc:
             raise RuntimeError(
                 "Could not load the IDS uEye SDK (pyueye). Install pyueye "
-                "(pip install pyueye) and the IDS Software Suite (uEye driver, "
-                "provides ueye_api.dll). Original error: " + str(exc)
+                "(pip install pyueye) plus either the IDS Software Suite "
+                "(ueye_api.dll) or, for Thorlabs DCC cameras, ThorCam with the "
+                "DCx driver (uc480_64.dll). Original error: " + str(exc)
             ) from exc
         if self._hCam is not None:
             self.disconnect()   # re-entry safe: a /connect retry starts clean
         self._ue = ueye
+        self.sdk_dll = os.path.basename(str(getattr(ueye, "get_dll_file", "")))
         self._last_seq_num = -1
 
         device_id = self.device_id
@@ -215,10 +389,8 @@ class IDSUEye:
             self._current_h = self.sensor_height_pixels
             self._alloc_ring(self._current_w, self._current_h)
 
-            ret = ueye.is_EnableEvent(self._hCam, ueye.IS_SET_EVENT_FRAME)
-            if ret != ueye.IS_SUCCESS:
-                raise RuntimeError(f"is_EnableEvent(FRAME) failed: {ret}")
-            self._event_enabled = True
+            self._event = _FrameEvent(ueye, self._hCam)
+            self._event.enable()
         except Exception:
             self.disconnect()
             raise
@@ -236,11 +408,11 @@ class IDSUEye:
             print(f"IDSUEye.disconnect StopLiveVideo: {exc}")
         self._capturing = False
         try:
-            if self._event_enabled:
-                ue.is_DisableEvent(h, ue.IS_SET_EVENT_FRAME)
+            if self._event is not None:
+                self._event.disable()
         except Exception as exc:
             print(f"IDSUEye.disconnect DisableEvent: {exc}")
-        self._event_enabled = False
+        self._event = None
         try:
             self._free_ring()
         except Exception as exc:
@@ -301,7 +473,9 @@ class IDSUEye:
     @property
     def device_info(self) -> dict:
         self._require()
-        return {"model": self.model, "serial": self.serial_number, "vendor": "IDS"}
+        vendor = "Thorlabs (uc480)" if "uc480" in self.sdk_dll.lower() else "IDS"
+        return {"model": self.model, "serial": self.serial_number, "vendor": vendor,
+                "sdk_dll": self.sdk_dll}
 
     def sensor_size(self) -> Tuple[int, int]:
         """Return ``(width, height)`` of the current image region (AOI)."""
@@ -541,11 +715,7 @@ class IDSUEye:
         ue = self._require()
         if self._capturing:
             return
-        if not self._event_enabled:
-            ret = ue.is_EnableEvent(self._hCam, ue.IS_SET_EVENT_FRAME)
-            if ret != ue.IS_SUCCESS:
-                raise RuntimeError(f"is_EnableEvent(FRAME) failed: {ret}")
-            self._event_enabled = True
+        self._event.enable()               # no-op if already enabled
         ret = ue.is_SetExternalTrigger(self._hCam, ue.IS_SET_TRIGGER_OFF)
         if ret != ue.IS_SUCCESS:
             raise RuntimeError(f"is_SetExternalTrigger(OFF/freerun) failed: {ret}")
@@ -575,9 +745,7 @@ class IDSUEye:
             return
         self._capturing = False   # aborts any in-flight _poll within one chunk
         ue.is_StopLiveVideo(self._hCam, ue.IS_FORCE_VIDEO_STOP)
-        if self._event_enabled:
-            ue.is_DisableEvent(self._hCam, ue.IS_SET_EVENT_FRAME)
-            self._event_enabled = False
+        self._event.disable()
 
     @property
     def is_grabbing(self) -> bool:
@@ -590,11 +758,8 @@ class IDSUEye:
         we already delivered (sequence-number dedup) — callers just wait again.
         """
         ue = self._ue
-        ret = ue.is_WaitEvent(self._hCam, ue.IS_SET_EVENT_FRAME, chunk_ms)
-        if ret == ue.IS_TIMED_OUT:
+        if not self._event.wait(chunk_ms):
             return None
-        if ret != ue.IS_SUCCESS:
-            raise RuntimeError(f"is_WaitEvent(FRAME) error: {ret}")
 
         nNum = ctypes.c_int()
         pcMem = ue.c_mem_p()

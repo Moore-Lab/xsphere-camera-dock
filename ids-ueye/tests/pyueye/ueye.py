@@ -98,6 +98,7 @@ class _State:
         self.locked = set()
         self.stall = False        # freeze frame delivery (test hook)
         self.fail_aoi_set = False # make the next is_AOI SET fail (test hook)
+        self.win_event_handle = None  # uc480-sim: handle registered via is_InitEvent
 
     def frames_now(self):
         if not self.capturing:
@@ -202,6 +203,39 @@ def is_DisableEvent(hCam, ev):
     return IS_SUCCESS
 
 
+# --- uc480-generation event API (Thorlabs DCC simulation) -------------------
+# When the test sets `_is_WaitEvent = None` on this module, the driver must use
+# is_InitEvent + WaitForSingleObject on a REAL Windows event; a mock signaler
+# thread (started by is_CaptureVideo) fires it whenever a frame boundary passes.
+
+def is_InitEvent(hCam, hEv, which):
+    S.win_event_handle = getattr(hEv, "value", hEv)
+    return IS_SUCCESS
+
+
+def is_ExitEvent(hCam, which):
+    S.win_event_handle = None
+    return IS_SUCCESS
+
+
+def _start_signaler():
+    import ctypes
+    import threading
+
+    def _signaler():
+        k32 = ctypes.windll.kernel32
+        last = 0
+        while S.capturing:
+            n = S.frames_now()
+            h = S.win_event_handle
+            if n > last and h and not S.stall:
+                last = n
+                k32.SetEvent(ctypes.c_void_p(h))
+            time.sleep(0.001)
+
+    threading.Thread(target=_signaler, daemon=True).start()
+
+
 def is_SetExternalTrigger(hCam, mode):
     return IS_SUCCESS
 
@@ -215,6 +249,8 @@ def is_CaptureVideo(hCam, mode):
     S.frames_produced = 0
     if not S.commanded_fps_survives_rearm:
         S.fps = 25.0   # freerun rate resets on re-arm (real uEye behavior)
+    if globals().get("_is_WaitEvent", True) is None:   # uc480-sim mode
+        _start_signaler()
     return IS_SUCCESS
 
 

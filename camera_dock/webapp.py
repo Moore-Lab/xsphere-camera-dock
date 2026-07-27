@@ -792,6 +792,7 @@ def _make_camera(name: str):
         "zelux": ("zelux-cs165mu", "zelux_cs165mu", "ZeluxCS165MU"),
         "hayear": ("hayear", "hayear", "HayearCamera"),
         "ids": ("ids-ueye", "ids_ueye", "IDSUEye"),
+        "dcc": ("ids-ueye", "ids_ueye", "IDSUEye"),   # Thorlabs DCC = uEye rebrand
     }
     if name not in table:
         raise SystemExit(f"Unknown camera '{name}'. Choose from: {', '.join(table)}")
@@ -807,8 +808,10 @@ def serve(sessions: dict, host: str = "127.0.0.1", port: int = 8000) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stream and control cameras over the web.")
-    parser.add_argument("cameras", nargs="+", choices=["basler", "zelux", "hayear", "ids"],
-                        help="one or more cameras to serve")
+    parser.add_argument("cameras", nargs="+",
+                        choices=["basler", "zelux", "hayear", "ids", "dcc"],
+                        help="one or more cameras to serve (dcc = older Thorlabs "
+                             "DCC-series, driven via the ids-ueye module)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
