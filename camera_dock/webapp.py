@@ -26,6 +26,8 @@ Per-camera endpoints (prefix ``/cam/{name}``):
     POST /controls/auto_exposure
     POST /controls/roi?x=&y=&w=&h=   ·   /controls/roi/reset   (blocked while recording)
     POST /record/start   ·   /record/stop
+    POST /timelapse/start?interval=30&hours=10&dir=&fmt=tiff   ·   /timelapse/stop
+    GET  /timelapse/status
 """
 
 from __future__ import annotations
@@ -63,6 +65,92 @@ def _slug(info: dict) -> str:
     return str(info.get("model", "camera")).replace(" ", "").replace("/", "-").lower()
 
 
+class Timelapse:
+    """Interval still-capture on a background thread (e.g. one shot every 30 s).
+
+    Samples the engine's latest frame — so it never touches the camera or the
+    acquisition thread, and runs happily alongside streaming and recording.
+    Shots are scheduled against the start time (``t0 + k*interval``), so the
+    cadence never drifts with per-shot save latency. Stills are saved at full
+    bit depth via :func:`imaging.save_snapshot`.
+    """
+
+    def __init__(self, session: "CameraSession", interval_s: float,
+                 duration_s: float, directory: str, fmt: str) -> None:
+        self.session = session
+        self.interval_s = float(interval_s)
+        self.duration_s = float(duration_s)          # 0 = run until stopped
+        self.directory = directory
+        self.fmt = fmt
+        self.taken = 0
+        self.missed = 0                              # ticks with no frame available
+        self.stale = 0                               # ticks where no NEW frame had arrived
+        self._last_index = -1                        # engine frame index of the last still
+        self.last_path = ""
+        self.error = ""
+        try:                                         # once: a mid-run camera hiccup
+            self._slug = _slug(session.camera.device_info)   # must not kill the loop
+        except Exception:
+            self._slug = session.name
+        self.t0 = perf_counter()
+        self.started_wall = datetime.now()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="timelapse", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        k = 0
+        while True:
+            due = self.t0 + k * self.interval_s
+            if self.duration_s > 0 and due - self.t0 > self.duration_s:
+                break
+            if self._stop.wait(max(0.0, due - perf_counter())):
+                break
+            frame, index = self.session.engine.latest()
+            if frame is None:
+                self.missed += 1
+            elif index == self._last_index:
+                # The engine hasn't produced a new frame since the last still —
+                # the camera has stopped delivering. Saving would fabricate
+                # hours of identical images that look like a healthy run.
+                self.stale += 1
+            else:
+                base = datetime.now().strftime(f"{self._slug}_%Y%m%d_%H%M%S_%f")
+                try:
+                    self.last_path = imaging.save_snapshot(
+                        frame, os.path.join(self.directory, base), self.fmt)
+                    self.taken += 1
+                    self._last_index = index
+                    self.error = ""                  # a later success clears a past hiccup
+                except Exception as exc:             # disk full/unwritable: record, keep going
+                    self.error = str(exc)
+                    self.missed += 1
+            # Re-sync the schedule if we fell behind (system sleep, slow disk):
+            # skipped slots are dropped rather than fired as a burst of catch-ups.
+            k = max(k + 1, int((perf_counter() - self.t0) / self.interval_s))
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+
+    @property
+    def running(self) -> bool:
+        return self._thread.is_alive()
+
+    def status(self) -> dict:
+        elapsed = perf_counter() - self.t0
+        remaining = max(0.0, self.duration_s - elapsed) if self.duration_s > 0 else None
+        next_in = self.interval_s - (elapsed % self.interval_s) if self.running else None
+        return {"running": self.running, "interval_s": self.interval_s,
+                "duration_s": self.duration_s, "elapsed_s": round(elapsed, 1),
+                "remaining_s": round(remaining, 1) if remaining is not None else None,
+                "next_in_s": round(next_in, 1) if next_in is not None else None,
+                "taken": self.taken, "missed": self.missed, "stale": self.stale,
+                "dir": self.directory,
+                "fmt": self.fmt, "last_path": self.last_path, "error": self.error,
+                "started": self.started_wall.strftime("%Y-%m-%d %H:%M:%S")}
+
+
 class CameraSession:
     """One camera + its acquisition engine + recording state, behind the web API."""
 
@@ -77,6 +165,7 @@ class CameraSession:
         self.error = ""
         self.recorder: HybridRecorder | None = None
         self.rec_path = ""
+        self.timelapse: Timelapse | None = None
         self.lock = threading.Lock()
 
     # --- lifecycle (also driven at runtime by /connect and /disconnect) ---
@@ -123,9 +212,15 @@ class CameraSession:
 
     def stop(self) -> None:
         """Release the camera (stop engine + disconnect) — frees it for other clients."""
+        with self.lock:                 # atomic vs concurrent timelapse/record starts
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
         if not self.ok:
             return
         try:
+            if self.timelapse is not None:
+                self.timelapse.stop()
             self.engine.set_sink(None)
             self.recorder = None
             self.engine.stop()
@@ -168,7 +263,8 @@ class CameraSession:
         return {"name": self.name, "ok": self.ok, "error": self.error,
                 "model": di.get("model"), "serial": di.get("serial"),
                 "width": w, "height": h,
-                "acquisition_fps": round(self.engine.acquisition_fps, 1)}
+                "acquisition_fps": round(self.engine.acquisition_fps, 1),
+                "acquisition_errors": self.engine.error_count}
 
     def controls(self) -> dict:
         c = self.camera
@@ -189,6 +285,8 @@ class CameraSession:
         with self.lock:
             if self.recorder is not None:
                 raise _Conflict("stop recording before changing ROI")
+            if self.timelapse is not None and self.timelapse.running:
+                raise _Conflict("stop the timelapse before changing ROI")
             self.engine.stop()
             try:
                 action()
@@ -199,6 +297,8 @@ class CameraSession:
     # --- recording ---
     def record_start(self) -> dict:
         with self.lock:
+            if not self.ok:             # session may have been torn down since sess()
+                raise _Conflict("camera not connected")
             if self.recorder is not None:
                 return {"recording": True}
             rec = HybridRecorder(clock=imaging.eastern_now)
@@ -220,6 +320,46 @@ class CameraSession:
             fps = self.engine.acquisition_fps or self.camera.get_frame_rate() or 30.0
         stats = rec.stop_and_encode(path, fps, self.to8, stamp=imaging.draw_timestamp)
         return {"recording": False, "stats": stats}
+
+    # --- timelapse ---
+    def timelapse_start(self, interval_s: float, hours: float,
+                        directory: str, fmt: str) -> dict:
+        with self.lock:
+            if not self.ok:             # session may have been torn down since sess()
+                raise _Conflict("camera not connected")
+            if self.timelapse is not None and self.timelapse.running:
+                st = self.timelapse.status()
+                st["already_running"] = True    # tell the UI nothing new was started
+                return st
+            interval_s = float(interval_s)
+            if interval_s < 1.0:
+                raise ValueError("interval must be at least 1 second")
+            hours = float(hours)
+            if hours < 0:
+                raise ValueError("hours must be >= 0 (0 = run until stopped)")
+            fmt = (fmt or "tiff").lower()
+            if fmt not in imaging.SNAPSHOT_FORMATS:
+                raise ValueError(f"format must be one of {', '.join(imaging.SNAPSHOT_FORMATS)}")
+            directory = (directory or "").strip() or datetime.now().strftime(
+                f"captures/timelapse_{_slug(self.camera.device_info)}_%Y%m%d_%H%M%S")
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except OSError as exc:
+                raise ValueError(f"cannot create save directory: {exc}")
+            self.timelapse = Timelapse(self, interval_s, hours * 3600.0, directory, fmt)
+            return self.timelapse.status()
+
+    def timelapse_stop(self) -> dict:
+        with self.lock:
+            tl = self.timelapse
+            if tl is None:
+                return {"running": False}
+            tl.stop()
+            return tl.status()
+
+    def timelapse_status(self) -> dict:
+        tl = self.timelapse
+        return tl.status() if tl is not None else {"running": False}
 
     # --- presets ---
     def save_preset(self, name: str) -> dict:
@@ -363,9 +503,12 @@ def create_app(sessions: dict, *, manage_lifecycle: bool = True):
         s = sessions.get(name)
         if s is None:
             raise HTTPException(404)
-        if s.recorder is not None:
-            raise HTTPException(409, "stop recording before disconnecting")
-        s.stop()                        # releases the camera for other clients
+        with s.lock:                    # guard + stop atomically vs concurrent starts
+            if s.recorder is not None:
+                raise HTTPException(409, "stop recording before disconnecting")
+            if s.timelapse is not None and s.timelapse.running:
+                raise HTTPException(409, "stop the timelapse before disconnecting")
+            s._stop_locked()            # releases the camera for other clients
         return {"connected": False}
 
     # --- per-camera controls ---
@@ -424,6 +567,32 @@ def create_app(sessions: dict, *, manage_lifecycle: bool = True):
     @app.post("/cam/{name}/record/stop")
     def record_stop(name: str):
         return sess(name).record_stop()
+
+    # --- per-camera timelapse (interval stills) ---
+    @app.post("/cam/{name}/timelapse/start")
+    def timelapse_start(name: str, interval: float = 30.0, hours: float = 0.0,
+                        dir: str = "", fmt: str = "tiff"):
+        s = sess(name)
+        try:
+            return s.timelapse_start(interval, hours, dir, fmt)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except _Conflict as exc:
+            raise HTTPException(409, str(exc))
+
+    @app.post("/cam/{name}/timelapse/stop")
+    def timelapse_stop(name: str):
+        s = sessions.get(name)
+        if s is None:
+            raise HTTPException(404)
+        return s.timelapse_stop()       # works even if the camera dropped mid-run
+
+    @app.get("/cam/{name}/timelapse/status")
+    def timelapse_status(name: str):
+        s = sessions.get(name)
+        if s is None:
+            raise HTTPException(404)
+        return s.timelapse_status()
 
     # --- per-camera presets ---
     @app.get("/cam/{name}/presets")
@@ -495,6 +664,17 @@ _CONTROL = """<!doctype html>
         <input type="text" id="roi" placeholder="x,y,w,h">
         <button onclick="setRoi()">set</button> <button onclick="resetRoi()">full</button></div>
       <div class="row"><button id="rec" class="rec" onclick="toggleRec()">● record</button></div>
+      <div class="row" id="tl-row"><label>timelapse (interval stills)</label>
+        every <input type="text" id="tl-int" value="30" style="width:44px"> s &nbsp;
+        for <input type="text" id="tl-hrs" value="10" style="width:44px"> h
+        <select id="tl-fmt" style="background:#222;color:#ddd;border:1px solid #444">
+          <option>tiff</option><option>png</option><option>npy</option></select>
+        <div style="margin-top:5px"><input type="text" id="tl-dir" style="width:100%"
+          placeholder="save folder (blank = captures/timelapse_...)"></div>
+        <div style="margin-top:5px"><button id="tl-btn" onclick="toggleTl()">&#9654; start timelapse</button>
+          <span style="color:#888;font-size:12px">0 h = until stopped</span></div>
+        <div id="tl-stat" style="color:#7cf;font-size:12px;margin-top:4px;word-break:break-all"></div>
+      </div>
       <div class="row"><label>preset</label>
         <input type="text" id="pname" placeholder="name" list="plist"><datalist id="plist"></datalist>
         <button onclick="savePreset()">save</button> <button onclick="loadPreset()">load</button></div>
@@ -539,6 +719,51 @@ async function setRoi(){const p=$('roi').value.split(',').map(Number); if(p.leng
   $('stat').textContent = r.ok?('ROI → '+j.roi.join(',')):('ROI: '+(j.detail||'error'));}
 async function resetRoi(){const j=await post('/controls/roi/reset'); $('roi').value=j.roi.join(','); $('stat').textContent='ROI → full';}
 function setRec(on){rec=on; $('rec').textContent=on?'■ stop':'● record'; $('rec').style.background=on?'#a33':'#622';}
+let tl=false, tlTimer=null;
+function fmtDur(s){s=Math.round(s); const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;
+  const p=[]; if(h)p.push(h+'h'); if(m)p.push(m+'m'); if(!h)p.push(ss+'s'); return p.join(' ');}
+function setTl(on){tl=on; $('tl-btn').innerHTML=on?'&#9632; stop timelapse':'&#9654; start timelapse';
+  $('tl-btn').style.background=on?'#a33':''; $('tl-btn').style.color=on?'#fdd':'';}
+function tlLine(j){let t=`${j.taken} stills`;
+  if(j.running){ t+=` · next in ${Math.max(0,Math.round(j.next_in_s))}s`;
+    if(j.remaining_s!=null) t+=` · ${fmtDur(j.remaining_s)} left`; }
+  t+=` → ${j.dir}`; if(j.missed) t+=` · ${j.missed} missed`;
+  if(j.stale) t+=` · ${j.stale} stale (camera not delivering?)`;
+  if(j.error) t+=` · ERROR: ${j.error}`;
+  return t;}
+function schedTl(){clearTimeout(tlTimer); tlTimer=setTimeout(pollTl,2000);}
+async function toggleTl(){
+  const btn=$('tl-btn'); if(btn.disabled) return;
+  btn.disabled=true;
+  try{
+    if(!tl){
+      const i=parseFloat($('tl-int').value), h=parseFloat($('tl-hrs').value);
+      if(!isFinite(i)||i<1){ $('tl-stat').textContent='invalid interval (seconds, min 1)'; return; }
+      if(!isFinite(h)||h<0){ $('tl-stat').textContent='invalid hours (0 = until stopped)'; return; }
+      const q=`interval=${i}&hours=${h}&dir=${encodeURIComponent($('tl-dir').value.trim())}&fmt=${$('tl-fmt').value}`;
+      const r=await fetch(`${BASE}/timelapse/start?${q}`,{method:'POST'}); const j=await r.json();
+      if(!r.ok){ $('tl-stat').textContent='error: '+(j.detail||r.status); return; }
+      setTl(true);
+      if(j.already_running){ $('tl-stat').textContent='already running — '+tlLine(j); }
+      else{ $('tl-dir').value=j.dir; $('tl-stat').textContent=tlLine(j); }
+      schedTl();
+    }else{
+      const j=await post('/timelapse/stop'); setTl(false); clearTimeout(tlTimer);
+      $('tl-stat').textContent='stopped — '+tlLine(j);
+    }
+  }finally{ btn.disabled=false; }
+}
+async function pollTl(){
+  try{ const j=await (await fetch(BASE+'/timelapse/status')).json();
+    if(j.running){ if(!tl) setTl(true); if(!$('tl-dir').value) $('tl-dir').value=j.dir;
+      $('tl-stat').textContent=tlLine(j); }
+    else if(tl){ setTl(false);
+      $('tl-stat').textContent = (j.taken===undefined)
+        ? 'server restarted — timelapse state lost (files already saved are safe)'
+        : 'finished — '+tlLine(j); }
+  }catch(e){}
+  if(tl) schedTl();
+}
 async function toggleRec(){if(!rec){const r=await post('/record/start'); setRec(true); $('stat').textContent='recording → '+r.path;}
   else{$('stat').textContent='encoding…'; const r=await post('/record/stop'); setRec(false); const s=r.stats;
     $('stat').textContent=`saved ${s.path} (${s.encoded} frames @ ${s.capture_fps} fps, dropped ${s.dropped})`;}}
@@ -554,7 +779,7 @@ async function poll(){try{const j=await (await fetch(BASE+'/info')).json();
   if(j.ok){ $('info').textContent=`${j.model} s/n ${j.serial} · ${j.width}x${j.height} · acq ${j.acquisition_fps.toFixed(1)} fps`; $('conn').textContent='disconnect'; }
   else { $('info').textContent='disconnected'+(j.error?(' · '+j.error):''); $('conn').textContent='connect'; }
 }catch(e){} setTimeout(poll,1000);}
-load(); poll();
+load(); poll(); pollTl();   // pollTl restores a running timelapse after a page reload
 </script>
 </body></html>"""
 

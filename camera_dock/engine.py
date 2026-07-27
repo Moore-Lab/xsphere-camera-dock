@@ -18,7 +18,7 @@ dock and the DAQ.
 from __future__ import annotations
 
 import threading
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Callable, Optional, Tuple
 
 import numpy as np
@@ -89,6 +89,7 @@ class AcquisitionEngine:
                 if not self._running:
                     break
                 self._errors += 1
+                sleep(0.05)   # a fast-failing camera (unplugged) must not busy-spin
                 continue
 
             t = perf_counter()
@@ -124,6 +125,11 @@ class AcquisitionEngine:
     def acquisition_fps(self) -> float:
         """Measured true acquisition rate (frames actually pulled per second)."""
         return self._acq_fps
+
+    @property
+    def error_count(self) -> int:
+        """Grab errors since start() — a growing count means the camera is unwell."""
+        return self._errors
 
     @property
     def is_running(self) -> bool:

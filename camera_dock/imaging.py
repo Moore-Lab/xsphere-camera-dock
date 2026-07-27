@@ -145,8 +145,10 @@ def save_snapshot(frame: np.ndarray, path_base: str, fmt: str = "tiff") -> str:
         np.save(path, frame)
     elif fmt == "png":
         path = path_base + ".png"
-        cv2.imwrite(path, frame)
+        if not cv2.imwrite(path, frame):     # imwrite fails silently (returns False),
+            raise IOError(f"could not write {path}")   # e.g. on over-long Windows paths
     else:
         path = path_base + ".tiff"
-        cv2.imwrite(path, frame)
+        if not cv2.imwrite(path, frame):
+            raise IOError(f"could not write {path}")
     return path
