@@ -1,0 +1,40 @@
+/* measure.css — styles for the shared measurement layer (measure.js).
+ * Used by BOTH the live camera page and the offline measure page. Keep it
+ * self-contained: no selectors that assume a particular page layout.
+ * See docs/MEASURE_INTEGRATION.md before editing. */
+
+/* stage: the media element with the SVG overlay on top */
+.measure-stage { position:relative; user-select:none; }
+.measure-stage > img, .measure-stage > video, .measure-stage > canvas {
+  display:block; width:100%; height:auto; border:1px solid #333;
+  background:#000; min-height:120px; }
+.measure-stage.draw { cursor:crosshair; }
+.measure-stage > svg { position:absolute; pointer-events:none; overflow:hidden; }
+
+/* toolbar */
+.toolbar { display:flex; align-items:center; gap:6px; flex-wrap:wrap; padding:0 0 8px; }
+.toolbar .sep { width:1px; height:20px; background:#333; margin:0 4px; }
+.toolbar .tool { background:#1c1c1c; border-color:#3a3a3a; color:#bbb; }
+.toolbar .tool:hover { background:#262626; }
+.toolbar .tool.active { background:#2a4a5a; border-color:#4a86a8; color:#cfefff; }
+.badge { color:#8ad; font-size:12px; background:#161d22; border:1px solid #2a3a44;
+         border-radius:10px; padding:3px 9px; }
+.badge.on { color:#9f9; border-color:#3a5a3a; background:#162016; }
+
+/* annotation overlay */
+.measure-stage svg .shape { fill:none; stroke:#4df; stroke-width:1.6; }
+.measure-stage svg .shape.hl { stroke:#ffd76e; stroke-width:2.6; }
+.measure-stage svg .handle { fill:#4df; }
+.measure-stage svg .preview { stroke:#ffd76e; stroke-dasharray:5 4; }
+.measure-stage svg text { fill:#dff; font:11px system-ui,sans-serif; stroke:#000;
+                          stroke-width:3.2; paint-order:stroke; }
+.measure-stage svg text.hl { fill:#ffd76e; }
+
+/* measurements table */
+.measure-tbl { width:100%; border-collapse:collapse; font-size:12px; }
+.measure-tbl td { padding:2px 3px; border-bottom:1px solid #242424; vertical-align:top; }
+.measure-tbl tr:hover { background:#202a30; }
+.measure-tbl .mt { color:#7cf; width:40px; }
+.measure-tbl .mu { color:#9c9; }
+.measure-tbl .mx { width:16px; text-align:right; color:#a66; cursor:pointer; }
+.measure-tbl .mx:hover { color:#f88; }

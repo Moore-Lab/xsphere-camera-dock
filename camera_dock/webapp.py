@@ -24,6 +24,9 @@ Per-camera endpoints (prefix ``/cam/{name}``):
     POST /record/start?max_seconds=&max_frames=  ·  /record/stop  ·  GET /record/status
     POST /timelapse/start?interval=&hours=&dir=&fmt=  ·  /timelapse/stop  ·  GET /timelapse/status
     GET  /presets  ·  POST /presets/save?preset=  ·  POST /presets/load?preset=
+    GET  /calibration  ·  POST /calibration/save?name=&um_per_px=&label=&notes=
+                       ·  POST /calibration/load?name=  ·  /calibration/clear
+                       ·  POST /calibration/delete?name=
     POST /connect  ·  POST /disconnect
 
 Error convention: 404 unknown camera · 409 state conflict (recording, timelapse,
@@ -51,7 +54,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
-from . import imaging, presets
+from . import calibration, imaging, presets
 from .base import Frame
 from .drivers import make_camera
 from .engine import AcquisitionEngine
@@ -440,9 +443,22 @@ class CameraSession:
 
     def _encode_worker(self, rec: HybridRecorder, path: str, fps: float,
                        cam_info: dict) -> None:
+        # Record the active pixel scale + geometry so analysis can convert to
+        # micrometres later without re-deriving the calibration.
+        extra = {}
+        try:
+            cal = calibration.active(self.name)
+            if cal:
+                extra["um_per_px"] = cal["um_per_px"]
+                extra["calibration"] = cal.get("name")
+            extra["roi"] = list(self.camera.get_roi()) if self.has_roi else None
+            extra["binning"] = list(self.camera.get_binning())
+        except Exception:
+            pass
         try:
             stats = rec.stop_and_encode(path, fps, self.to8,
-                                        stamp=imaging.draw_timestamp, camera=cam_info)
+                                        stamp=imaging.draw_timestamp, camera=cam_info,
+                                        extra=extra)
         except Exception as exc:
             stats = {"ok": False, "error": str(exc), "path": None}
         with self.lock:
@@ -575,16 +591,23 @@ def create_app(sessions: dict, *, manage_lifecycle: bool = True):
         return s
 
     # --- pages / static ---
+    # These are read from disk per request and are edited often (the UI is the
+    # eval surface). Tell browsers to revalidate, or an edit silently doesn't
+    # reach the page until someone hard-reloads.
+    def _page(fname: str) -> FileResponse:
+        return FileResponse(os.path.join(_STATIC, fname),
+                            headers={"Cache-Control": "no-cache"})
+
     @app.get("/")
     def index():
-        return FileResponse(os.path.join(_STATIC, "index.html"))
+        return _page("index.html")
 
     @app.get("/static/{fname}")
     def static_file(fname: str):
         path = os.path.join(_STATIC, os.path.basename(fname))
         if not os.path.isfile(path):
             raise HTTPException(404)
-        return FileResponse(path)
+        return _page(os.path.basename(fname))
 
     @app.get("/favicon.ico")
     def favicon():
@@ -594,7 +617,7 @@ def create_app(sessions: dict, *, manage_lifecycle: bool = True):
     def cam_page(name: str):
         if name not in sessions:
             raise HTTPException(404)
-        return FileResponse(os.path.join(_STATIC, "cam.html"))
+        return _page("cam.html")
 
     @app.get("/cameras")
     def cameras():
@@ -751,6 +774,43 @@ def create_app(sessions: dict, *, manage_lifecycle: bool = True):
     @app.get("/cam/{name}/timelapse/status")
     def timelapse_status(name: str):
         return sess(name, need_ok=False).timelapse_status()
+
+    # --- calibration (pixel -> micrometre scale) ---
+    @app.get("/cam/{name}/calibration")
+    def get_calibration(name: str):
+        sess(name, need_ok=False)
+        return calibration.document(name)
+
+    @app.post("/cam/{name}/calibration/save")
+    def save_calibration(name: str, um_per_px: float, cal: str = "default",
+                         label: str = "", notes: str = ""):
+        sess(name, need_ok=False)
+        try:
+            calibration.save_entry(name, cal, um_per_px, label=label, notes=notes)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        return calibration.document(name)
+
+    @app.post("/cam/{name}/calibration/load")
+    def load_calibration(name: str, cal: str):
+        sess(name, need_ok=False)
+        try:
+            calibration.set_active(name, cal)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        return calibration.document(name)
+
+    @app.post("/cam/{name}/calibration/clear")
+    def clear_calibration(name: str):
+        sess(name, need_ok=False)
+        calibration.set_active(name, None)
+        return calibration.document(name)
+
+    @app.post("/cam/{name}/calibration/delete")
+    def delete_calibration(name: str, cal: str):
+        sess(name, need_ok=False)
+        calibration.delete_entry(name, cal)
+        return calibration.document(name)
 
     # --- presets ---
     @app.get("/cam/{name}/presets")

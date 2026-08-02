@@ -37,6 +37,15 @@ let epoch = 0;              // stream reconnect counter
 let recState = "idle";
 let tlOn = false, tlTimer = null;
 
+// Measuring is done by the SHARED layer (measure.js) — the same code the
+// offline analysis page uses. This page only supplies the live-specific bits:
+// the sensor-coordinate transform, the ROI tool, and server-backed calibration.
+let M = null;               // MeasureLayer instance
+let tool = "roi";           // roi (ours) | line | circle | rect (the layer's)
+let umPerPx = null;         // active calibration scale (null = pixels only)
+let calDoc = { active: null, entries: {} };
+const ANNOT_KEY = "xsphere.annots." + NAME;
+
 // ------------------------------------------------------------------ utils --
 async function post(url) {
   const r = await fetch(BASE + url, { method: "POST" });
@@ -141,6 +150,7 @@ function cancelDebounces() {
 function adoptCaps(c) {
   caps = c;
   capsRev += 1;
+  if (M) M.epoch = capsRev;   // discards any drag started under the old geometry
   R.hasRoi = !!c.has_roi;
   R.imageSize = c.image_size || null;
   R.sensor = c.sensor_size || null;
@@ -149,6 +159,7 @@ function adoptCaps(c) {
   buildControls();
   drawRoiFields();
   $("roi-row").style.display = R.hasRoi ? "" : "none";
+  redraw();                  // annotations follow the new geometry
 }
 
 async function loadCaps() {
@@ -165,6 +176,21 @@ function drawRoiFields() {
   $("roi-w").value = R.roi[2]; $("roi-h").value = R.roi[3];
   $("roi-eff").textContent = R.imageSize ? `image ${R.imageSize[0]}×${R.imageSize[1]}` : "";
 }
+
+// ------------------------------------------------------- coordinate maps ---
+// The <img> shows the current ROI at some displayed size. Annotations are kept
+// in sensor pixels, so both directions go through the ROI origin and binning.
+function sensorToDisplay(sx, sy) {
+  const rect = contentRect();
+  const [Rx, Ry] = R.roi, [bx, by] = R.binning, [Iw, Ih] = R.imageSize;
+  return { u: (sx - Rx) / bx * (rect.w / Iw), v: (sy - Ry) / by * (rect.h / Ih) };
+}
+function displayToSensor(u, v) {
+  const rect = contentRect();
+  const [Rx, Ry] = R.roi, [bx, by] = R.binning, [Iw, Ih] = R.imageSize;
+  return { x: Rx + (u * Iw / rect.w) * bx, y: Ry + (v * Ih / rect.h) * by };
+}
+function mappable() { return !!(R.roi && R.imageSize && R.binning); }
 
 // ---------------------------------------------------------------- ROI ops --
 // Every successful change adopts the server echo; pushes previous ROI (if the
@@ -207,10 +233,49 @@ $("streambox").addEventListener("contextmenu", async ev => {
   }
 });
 
-// ------------------------------------------------------------- drag-to-ROI --
-const img = $("stream"), box = $("dragbox"), sbox = $("streambox");
+// ------------------------------------------------------- measurement layer --
+// The drawing tools, shapes, labels, table and persistence all come from
+// measure.js. What is specific to the LIVE page is the transform below: the
+// shared layer stores annotations in "native" pixels, which here means SENSOR
+// pixels, so a measurement stays pinned to the scene across ROI crops.
+//
+// NOTE[live->offline]: this transform IS the whole online/offline bridge.
+// Offline hosts pass nothing and get MeasureLayer.defaultTransform (file pixels
+// -> displayed box). Keep both sides in sync if the mapping ever changes.
+const liveTransform = {
+  ready: () => mappable(),
+  imageSize: () => R.imageSize,
+  toDisplay: (x, y) => sensorToDisplay(x, y),
+  toNative: (u, v) => displayToSensor(u, v),
+};
+
+function renderMeasures() {
+  M.renderList();
+  const n = M.annots.length;
+  $("measure-count").textContent = n ? `${n}` : "";
+  $("measure-empty").style.display = n ? "none" : "";
+  renderCalSources();
+}
+
+function redraw() { if (M) M.redraw(); }
+
+// ------------------------------------------------------------------ tools --
+const ROI_HINT =
+  "drag: crop the sensor to that region (raises frame rate) · right-click: step back out";
+function setTool(t) {
+  tool = t;
+  M.setTool(t);                        // highlights the button, incl. our "roi"
+  sbox.classList.toggle("draw", t !== "roi");
+  $("hint").textContent = (t === "roi" ? ROI_HINT
+    : M.hint() + " · right-click: step back out of a zoom");
+}
+
+// ------------------------------------------------- pointer plumbing --------
+// The shared layer handles its own drawing tools; these handlers only run for
+// the dock's own ROI tool.
+const img = $("stream"), box = $("dragbox"), sbox = $("streambox"), svg = $("overlay");
 img.addEventListener("dragstart", ev => ev.preventDefault());
-let drag = null;            // {x0, y0, snap:{rect, Iw, Ih, roi, bin}}
+let drag = null;            // ROI drag: {x0, y0, snap:{rect, Iw, Ih, roi, bin, rev}}
 
 function contentRect() {
   // Displayed content area EXCLUDING the css border (mapping spec).
@@ -221,17 +286,15 @@ function contentRect() {
 }
 
 sbox.addEventListener("pointerdown", ev => {
-  if (ev.button !== 0 || !R.hasRoi || !R.roi || !R.imageSize) return;
+  if (ev.button !== 0 || tool !== "roi" || !R.hasRoi || !R.roi || !R.imageSize) return;
   const [Iw, Ih] = R.imageSize;
   // Staleness gate: the <img> must actually be showing current-geometry frames.
   if (img.naturalWidth !== Iw || img.naturalHeight !== Ih) {
     toast("stream still updating — try again"); return;
   }
-  const rect = contentRect();
-  drag = {
-    x0: ev.clientX, y0: ev.clientY,
-    snap: { rect, Iw, Ih, roi: [...R.roi], bin: [...R.binning], rev: capsRev },
-  };
+  drag = { x0: ev.clientX, y0: ev.clientY,
+           snap: { rect: contentRect(), Iw, Ih, roi: [...R.roi],
+                   bin: [...R.binning], rev: capsRev } };
   try { sbox.setPointerCapture(ev.pointerId); } catch (e) { }
   ev.preventDefault();
 });
@@ -275,6 +338,84 @@ sbox.addEventListener("pointerup", ev => {
   const h = (iy1 - iy0 + 1) * bin[1];
   applyRoi(`/roi?x=${x}&y=${y}&w=${w}&h=${h}`);
 });
+
+// ----------------------------------------------------------- calibration --
+const num = MeasureLayer.num;
+
+function applyCalDoc(doc) {
+  calDoc = doc || { active: null, entries: {} };
+  umPerPx = calDoc.entry ? Number(calDoc.entry.um_per_px) : null;
+  // The shared layer owns the badge, the label formatting and the redraw.
+  M.setScale(umPerPx, calDoc.entry ? (calDoc.entry.label || calDoc.active) : "");
+  renderCal();
+  renderMeasures();
+}
+function renderCal() {
+  const sel = $("cal-list");
+  const names = Object.keys(calDoc.entries || {});
+  const keep = sel.value;
+  sel.innerHTML = names.length
+    ? names.map(n => `<option value="${n}"${n === calDoc.active ? " selected" : ""}>` +
+        `${n} — ${num(calDoc.entries[n].um_per_px)} µm/px</option>`).join("")
+    : `<option value="">(none saved)</option>`;
+  if (keep && names.includes(keep)) sel.value = keep;
+}
+function renderCalSources() {
+  const sel = $("cal-src");
+  const lines = M.lines;
+  const keep = sel.value;
+  sel.innerHTML = lines.length
+    ? lines.map(a => `<option value="${a.id}">line ` +
+        `${num(MeasureLayer.lineLength(a))} px</option>`).join("")
+    : `<option value="">(draw a line first)</option>`;
+  if (keep) sel.value = keep;
+}
+async function calPost(url) {
+  const { ok, status, j } = await post(url);
+  if (!ok) { $("cal-stat").textContent = j.detail || `error ${status}`; return false; }
+  applyCalDoc(j);
+  return true;
+}
+$("cal-load").onclick = async () => {
+  const n = $("cal-list").value;
+  if (!n) return;
+  if (await calPost(`/calibration/load?cal=${encodeURIComponent(n)}`))
+    $("cal-stat").textContent = `loaded ${n}`;
+};
+$("cal-clear").onclick = async () => {
+  if (await calPost("/calibration/clear"))
+    $("cal-stat").textContent = "cleared — showing pixels only";
+};
+$("cal-del").onclick = async () => {
+  const n = $("cal-list").value;
+  if (!n) return;
+  if (await calPost(`/calibration/delete?cal=${encodeURIComponent(n)}`))
+    $("cal-stat").textContent = `deleted ${n}`;
+};
+$("cal-save").onclick = async () => {
+  const n = ($("cal-name").value || "default").trim();
+  const v = parseFloat($("cal-scale").value);
+  if (!isFinite(v) || v <= 0) { $("cal-stat").textContent = "enter a positive µm/px"; return; }
+  if (await calPost(`/calibration/save?cal=${encodeURIComponent(n)}&um_per_px=${v}`))
+    $("cal-stat").textContent = `saved ${n} and made it active`;
+};
+$("cal-derive").onclick = async () => {
+  const a = M.byId(parseInt($("cal-src").value, 10));
+  const known = parseFloat($("cal-known").value);
+  if (!a) { $("cal-stat").textContent = "draw a line across a known feature first"; return; }
+  if (!isFinite(known) || known <= 0) { $("cal-stat").textContent = "enter the true length in µm"; return; }
+  const px = MeasureLayer.lineLength(a);
+  const scale = known / px;
+  $("cal-scale").value = scale.toPrecision(6);
+  const n = ($("cal-name").value || "default").trim();
+  if (await calPost(`/calibration/save?cal=${encodeURIComponent(n)}&um_per_px=${scale}` +
+                    `&notes=${encodeURIComponent(`${num(px)} px = ${known} µm`)}`))
+    $("cal-stat").textContent = `${num(px)} px = ${known} µm → ${num(scale)} µm/px (saved as ${n})`;
+};
+async function loadCal() {
+  try { applyCalDoc(await (await fetch(BASE + "/calibration")).json()); }
+  catch (e) { }
+}
 
 // ------------------------------------------------------------- actions -----
 $("autoexp").onclick = async () => {
@@ -454,7 +595,22 @@ async function pollInfo() {
 
 // ------------------------------------------------------------- boot --------
 (async function boot() {
+  M = new MeasureLayer({
+    media: img, svg, stage: sbox,
+    transform: liveTransform,          // sensor pixels — the live/offline bridge
+    storageKey: ANNOT_KEY,
+    onChange: renderMeasures,
+    onToolChange: t => { if (t !== tool) setTool(t); },
+  });
+  M.renderList($("measure-tbl").querySelector("tbody"));
+  M.buildToolbar($("toolbar"), [{
+    tool: "roi", glyph: "⛶", label: "ROI",
+    title: "drag a box to crop the sensor readout (raises frame rate)",
+  }]);
+  setTool("roi");
   await loadCaps();
+  await loadCal();          // sets umPerPx, then re-renders measurements
+  renderMeasures();
   resetStream();
   refreshPresets();
   pollInfo();

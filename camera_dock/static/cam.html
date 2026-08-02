@@ -1,6 +1,7 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>camera</title>
 <link rel="stylesheet" href="../static/dock.css">
+<link rel="stylesheet" href="../static/measure.css">
 <link rel="icon" type="image/x-icon" href="../static/xsphere.ico">
 </head>
 <body>
@@ -12,12 +13,13 @@
 </header>
 <div class="main">
   <div>
-    <div class="streambox" id="streambox">
+    <div class="toolbar" id="toolbar"></div>
+    <div class="streambox measure-stage" id="streambox">
       <img id="stream" draggable="false" alt="camera stream">
+      <svg id="overlay"></svg>
       <div id="dragbox"></div>
     </div>
-    <div class="hint">drag: zoom to region (sensor ROI) &nbsp;·&nbsp; right-click:
-      step back out &nbsp;·&nbsp; fps rises as the region shrinks</div>
+    <div class="hint" id="hint"></div>
   </div>
   <div class="panel">
     <div id="controls"></div>
@@ -33,6 +35,38 @@
       <input id="roi-w" type="text"> <input id="roi-h" type="text">
       <button id="roi-apply">apply</button> <button id="roi-full">full frame</button>
     </div>
+
+    <div class="row" id="measure-row">
+      <label>measurements <span class="val" id="measure-count"></span></label>
+      <table id="measure-tbl" class="measure-tbl"><tbody></tbody></table>
+      <div class="small" id="measure-empty">pick a draw tool and drag on the image</div>
+    </div>
+
+    <div class="row" id="cal-row">
+      <label>calibration (µm per sensor pixel)</label>
+      <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap">
+        <select id="cal-list" style="flex:1; min-width:110px"></select>
+        <button id="cal-load">load</button>
+        <button id="cal-clear" title="show pixels only">clear</button>
+        <button id="cal-del" title="delete the selected calibration">&#10005;</button>
+      </div>
+      <div style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap">
+        <input id="cal-name" type="text" placeholder="name (e.g. 10x)" style="width:92px">
+        <input id="cal-scale" type="text" placeholder="µm/px" style="width:74px">
+        <button id="cal-save">save</button>
+      </div>
+      <div style="margin-top:6px" class="small">
+        or derive it: draw a line across something of known size, then
+      </div>
+      <div style="margin-top:4px; display:flex; gap:6px; align-items:center; flex-wrap:wrap">
+        <select id="cal-src" style="flex:1; min-width:110px"></select>
+        <span class="small">is</span>
+        <input id="cal-known" type="text" placeholder="µm" style="width:66px">
+        <button id="cal-derive">compute</button>
+      </div>
+      <div class="small" id="cal-stat"></div>
+    </div>
+
     <div class="row" id="rec-row">
       <label>recording <span class="val" id="rec-info"></span></label>
       limit <input id="rec-sec" type="text" style="width:48px" placeholder="s"> s /
@@ -60,5 +94,6 @@
   </div>
 </div>
 <div id="toast"></div>
+<script src="../static/measure.js"></script>
 <script src="../static/cam.js"></script>
 </body></html>

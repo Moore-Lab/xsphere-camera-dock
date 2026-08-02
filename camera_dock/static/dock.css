@@ -20,11 +20,10 @@ input[type=range] { width:100%; }
 .card img { display:block; max-width:46vw; height:auto; border:1px solid #333; }
 .card .cap { text-align:center; padding-top:6px; color:#7cf; }
 
-/* camera page */
+/* camera page — measurement/toolbar/overlay styles live in measure.css, which
+   is shared with the offline measure page. */
 .main { display:flex; flex-wrap:wrap; gap:14px; padding:12px; align-items:flex-start; }
-.streambox { position:relative; width:min(72vw, 1080px); user-select:none; }
-.streambox img { display:block; width:100%; height:auto; border:1px solid #333;
-                 background:#000; min-height:120px; }
+.streambox { width:min(72vw, 1080px); }   /* .measure-stage supplies the rest */
 #dragbox { position:absolute; border:1.5px dashed #4df; background:rgba(80,200,255,.12);
            pointer-events:none; display:none; }
 .hint { color:#667; font-size:12px; padding-top:4px; }

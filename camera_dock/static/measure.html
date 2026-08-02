@@ -1,0 +1,243 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>offline measure — xsphere</title>
+<link rel="stylesheet" href="dock.css">
+<link rel="stylesheet" href="measure.css">
+<link rel="icon" type="image/x-icon" href="xsphere.ico">
+<style>
+  .measure-stage { width:min(72vw, 1080px); }
+  .drop { border:1px dashed #3a3a3a; border-radius:6px; padding:18px; color:#777;
+          text-align:center; }
+  .drop.over { border-color:#4a86a8; color:#8cf; background:#141c22; }
+  .vidbar { display:flex; align-items:center; gap:8px; padding-top:6px; flex-wrap:wrap; }
+  .vidbar input[type=range] { flex:1; min-width:160px; }
+</style>
+</head>
+<body>
+<header>
+  <b>offline measure</b>
+  <span class="small">a still or a video · same tools as the live camera page</span>
+  <span style="flex:1"></span>
+  <span id="src" class="small"></span>
+</header>
+<div class="main">
+  <div>
+    <div class="toolbar" id="toolbar"></div>
+    <div class="measure-stage" id="stage" hidden>
+      <img id="still" alt="">
+      <video id="vid" hidden playsinline></video>
+      <svg id="overlay"></svg>
+    </div>
+    <div class="vidbar" id="vidbar" hidden>
+      <button id="play">▶</button>
+      <button id="prev" title="step back one frame">⏴</button>
+      <button id="next" title="step forward one frame">⏵</button>
+      <input type="range" id="seek" min="0" max="1000" value="0">
+      <span class="small" id="vtime">0.00 s</span>
+      <span class="small" id="vfps"></span>
+    </div>
+    <div class="hint" id="hint"></div>
+    <div class="drop" id="drop" style="margin-top:10px">
+      drop an image or video here, or
+      <input type="file" id="file" accept="image/*,video/*">
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <label>measurements <span class="val" id="measure-count"></span></label>
+      <table class="measure-tbl" id="measure-tbl"><tbody></tbody></table>
+      <div class="small" id="measure-empty">pick a draw tool and drag on the image</div>
+    </div>
+
+    <div class="row">
+      <label>calibration (µm per pixel)</label>
+      <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap">
+        <input id="cal-scale" type="text" placeholder="µm/px" style="width:88px">
+        <button id="cal-apply">apply</button>
+        <button id="cal-clear">clear</button>
+      </div>
+      <div style="margin-top:6px" class="small">
+        or derive it: draw a line across something of known size, then
+      </div>
+      <div style="margin-top:4px; display:flex; gap:6px; align-items:center; flex-wrap:wrap">
+        <select id="cal-src" style="flex:1; min-width:110px"></select>
+        <span class="small">is</span>
+        <input id="cal-known" type="text" placeholder="µm" style="width:66px">
+        <button id="cal-derive">compute</button>
+      </div>
+      <div style="margin-top:6px" class="small">
+        a dock recording's <code>.json</code> sidecar carries its calibration:
+      </div>
+      <div style="margin-top:4px"><input type="file" id="sidecar" accept=".json"></div>
+      <div class="small" id="cal-stat"></div>
+    </div>
+
+    <div class="row">
+      <label>annotations</label>
+      <button id="exp">export JSON</button>
+      <input type="file" id="imp-file" accept=".json" style="display:none">
+      <button id="imp">import</button>
+    </div>
+    <div id="stat"></div>
+  </div>
+</div>
+
+<script src="measure.js"></script>
+<script>
+/* Offline host for the shared measurement layer.
+ * ---------------------------------------------------------------------
+ * This page exists to prove — and to hand over — the offline half of the
+ * live/offline split: it uses measure.js UNMODIFIED, with NO transform of its
+ * own (the default file-pixel mapping is exactly right for stills and video)
+ * and no server. The analysis app should reuse measure.js/measure.css the same
+ * way; treat this file as a worked example, not as the product.
+ *
+ * NOTE[live->offline]: the only thing the live page adds is a transform that
+ * maps sensor pixels -> displayed pixels (it can crop the sensor). If you need
+ * a cropping/zooming viewer offline, supply the same shape of transform rather
+ * than changing how annotations are stored.
+ */
+"use strict";
+const $ = id => document.getElementById(id);
+const stage = $("stage"), still = $("still"), vid = $("vid"), svg = $("overlay");
+let M = null, media = still, umPerPx = null;
+
+function makeLayer(mediaEl, key) {
+  if (M) M.destroy();
+  media = mediaEl;
+  M = new MeasureLayer({
+    media: mediaEl, svg, stage,          // default transform = file pixels
+    storageKey: key,
+    onChange: renderCount,
+    onToolChange: t => {
+      stage.classList.add("draw");
+      $("hint").textContent = M.hint();
+    },
+  });
+  M.renderList($("measure-tbl").querySelector("tbody"));
+  M.buildToolbar($("toolbar"));
+  if (umPerPx) M.setScale(umPerPx, "manual");
+  renderCount();
+}
+function renderCount() {
+  const n = M ? M.annots.length : 0;
+  $("measure-count").textContent = n ? `${n}` : "";
+  $("measure-empty").style.display = n ? "none" : "";
+  const sel = $("cal-src"), keep = sel.value;
+  const lines = M ? M.lines : [];
+  sel.innerHTML = lines.length
+    ? lines.map(a => `<option value="${a.id}">line ` +
+        `${MeasureLayer.num(MeasureLayer.lineLength(a))} px</option>`).join("")
+    : `<option value="">(draw a line first)</option>`;
+  if (keep) sel.value = keep;
+}
+
+/* ------------------------------------------------------------ file input -- */
+function openFile(f) {
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  const isVideo = f.type.startsWith("video") || /\.(avi|mp4|mov|mkv|webm)$/i.test(f.name);
+  stage.hidden = false;
+  $("src").textContent = f.name;
+  // Annotations persist per file name, so reopening the same clip restores them.
+  const key = "xsphere.measure." + f.name;
+  if (isVideo) {
+    still.hidden = true; vid.hidden = false; $("vidbar").hidden = false;
+    vid.src = url;
+    vid.onloadedmetadata = () => { $("seek").max = Math.max(1, vid.duration * 1000);
+                                   makeLayer(vid, key); };
+    vid.onerror = () => $("stat").textContent =
+      "the browser cannot decode this video (FFV1 .avi from the dock is not a " +
+      "browser format — transcode it, or measure a still)";
+  } else {
+    vid.hidden = true; vid.pause(); still.hidden = false; $("vidbar").hidden = true;
+    still.src = url;
+    still.onload = () => makeLayer(still, key);
+    still.onerror = () => $("stat").textContent =
+      "the browser cannot decode this image (16-bit TIFF is not a browser format — " +
+      "export a PNG from the analysis side)";
+  }
+}
+$("file").onchange = e => openFile(e.target.files[0]);
+const drop = $("drop");
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over");
+                     openFile(e.dataTransfer.files[0]); };
+
+/* ---------------------------------------------------------- video controls */
+$("play").onclick = () => { vid.paused ? vid.play() : vid.pause();
+                            $("play").textContent = vid.paused ? "▶" : "⏸"; };
+$("prev").onclick = () => { vid.pause(); vid.currentTime = Math.max(0, vid.currentTime - 1 / 30); };
+$("next").onclick = () => { vid.pause(); vid.currentTime += 1 / 30; };
+$("seek").oninput = () => { vid.currentTime = $("seek").value / 1000; };
+vid.ontimeupdate = () => { $("seek").value = vid.currentTime * 1000;
+                           $("vtime").textContent = vid.currentTime.toFixed(2) + " s"; };
+
+/* ------------------------------------------------------------ calibration */
+function setScale(v, label) {
+  umPerPx = (isFinite(v) && v > 0) ? v : null;
+  if (M) M.setScale(umPerPx, label);
+  $("cal-scale").value = umPerPx ? String(umPerPx) : "";
+}
+$("cal-apply").onclick = () => {
+  const v = parseFloat($("cal-scale").value);
+  if (!isFinite(v) || v <= 0) { $("cal-stat").textContent = "enter a positive µm/px"; return; }
+  setScale(v, "manual");
+  $("cal-stat").textContent = `scale ${MeasureLayer.num(v)} µm/px`;
+};
+$("cal-clear").onclick = () => { setScale(NaN); $("cal-stat").textContent = "pixels only"; };
+$("cal-derive").onclick = () => {
+  if (!M) return;
+  const a = M.byId(parseInt($("cal-src").value, 10));
+  const known = parseFloat($("cal-known").value);
+  if (!a) { $("cal-stat").textContent = "draw a line across a known feature first"; return; }
+  if (!isFinite(known) || known <= 0) { $("cal-stat").textContent = "enter the true length in µm"; return; }
+  const px = MeasureLayer.lineLength(a), scale = known / px;
+  setScale(scale, "derived");
+  $("cal-stat").textContent =
+    `${MeasureLayer.num(px)} px = ${known} µm → ${MeasureLayer.num(scale)} µm/px`;
+};
+// A dock recording writes <stem>.json next to the video with the camera's
+// active calibration; loading it here reproduces the exact live scale.
+$("sidecar").onchange = e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const fr = new FileReader();
+  fr.onload = () => {
+    try {
+      const j = JSON.parse(fr.result);
+      if (j.um_per_px) {
+        setScale(Number(j.um_per_px), j.calibration || "sidecar");
+        $("cal-stat").textContent =
+          `from sidecar: ${MeasureLayer.num(j.um_per_px)} µm/px` +
+          (j.calibration ? ` (${j.calibration})` : "");
+      } else {
+        $("cal-stat").textContent = "that sidecar has no um_per_px " +
+          "(the camera had no calibration loaded when it recorded)";
+      }
+    } catch (err) { $("cal-stat").textContent = "could not read that JSON"; }
+  };
+  fr.readAsText(f);
+};
+
+/* -------------------------------------------------------- export / import */
+$("exp").onclick = () => {
+  if (!M) return;
+  const blob = new Blob([JSON.stringify(M.export(), null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = ($("src").textContent || "measure") + ".measure.json";
+  a.click();
+};
+$("imp").onclick = () => $("imp-file").click();
+$("imp-file").onchange = e => {
+  const f = e.target.files[0];
+  if (!f || !M) return;
+  const fr = new FileReader();
+  fr.onload = () => { try { M.import(JSON.parse(fr.result)); renderCount(); }
+                      catch (err) { $("stat").textContent = "could not read that JSON"; } };
+  fr.readAsText(f);
+};
+</script>
+</body></html>

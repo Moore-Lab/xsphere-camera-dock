@@ -13,11 +13,15 @@
 </style>
 </head>
 <body>
-<header><b>xsphere camera dock</b> &mdash; live streams</header>
+<header><b>xsphere camera dock</b> &mdash; live streams
+  <span style="flex:1"></span>
+  <a href="static/measure.html" title="measure a saved still or video — same tools, no camera">offline measure &rarr;</a>
+</header>
 <div class="grid" id="grid"></div>
 <script>
 // API base = wherever this page is mounted (works standalone and under /cameras/).
 const BASE = location.pathname.replace(/\/$/, '');
+document.querySelector('header a').href = BASE + '/static/measure.html';
 const cards = {};   // name -> {root, img, status, btn, ok}
 
 function makeCard(c) {

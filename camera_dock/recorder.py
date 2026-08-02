@@ -152,7 +152,8 @@ class HybridRecorder:
     # --- finalize (dedicated encode thread; never the capture path) --------
     def stop_and_encode(self, path: str, fps: float, to_8bit: To8Bit,
                         stamp: Optional[Stamp] = None,
-                        camera: Optional[dict] = None) -> dict:
+                        camera: Optional[dict] = None,
+                        extra: Optional[dict] = None) -> dict:
         """Stop accepting frames, encode to a lossless video, write sidecars.
 
         Call only after the engine's sink has been detached (set_sink(None) is a
@@ -200,7 +201,8 @@ class HybridRecorder:
                 path, t_sw=self._times, hw_counts=self._hw_counts,
                 hw_ts_ns=self._hw_ts, camera=camera, width=w, height=h,
                 nominal_fps=fps, start_unix=self._start_unix, stop_unix=stop_unix,
-                extra={"ram_frames": len(self._ram), "spilled": self._spilled})
+                extra={"ram_frames": len(self._ram), "spilled": self._spilled,
+                       **(extra or {})})
 
         return {
             "ok": ok,
