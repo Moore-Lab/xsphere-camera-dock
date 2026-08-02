@@ -13,6 +13,57 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-08-02 — Rebuild: standardized driver interface + drag-ROI eval server
+
+**Context.** Zelux-first redesign per `docs/DESIGN.md` (spec written and adversarially
+reviewed this session — four-lens review: SDK reality, web UX, concurrency, DAQ
+contract). Goal: one common command set for all cameras, per-camera drivers translating
+native controls, graceful unsupported handling, and a standalone eval server whose
+features later fold into the DAQ.
+
+- **`base.py` rewritten**: `CameraDriver` ABC + generic scalar-control funnel.
+  Drivers *register* `ControlSpec`s (units, fresh-range getter, int/float kind,
+  linear/log scale); the base owns normalization (0..1 across the native range),
+  clamping against write-time hardware ranges, casting, read-back, and the
+  never-raise `ControlValue` envelope. Unsupported control ⇒ absent from
+  capabilities, `supported=False` on set (HTTP 422) — one convention, no exceptions.
+  Legacy shims (`get_exposure`/`set_frame_rate`/…) keep `presets.py` and
+  `imaging.auto_expose` unchanged.
+- **Drivers moved into the dock** (`camera_dock/drivers/`): `zelux.py` (rebuilt on
+  TSI SDK 0.0.8: internal RLock around every SDK call with non-blocking polls;
+  atomic disarm→ROI→read-back→re-arm→re-trigger; fps-then-exposure re-apply after
+  every re-arm; fps/exposure duty coupling with warnings + side_effects; hw
+  frame-count/timestamp captured per frame) and `sim.py` (hardware-free fixture).
+  `make_camera(token)` is contractually never-raise (UnavailableCamera stub) —
+  the panel boots with the bat's `basler zelux hayear` and paused tokens degrade.
+- **Engine**: monotonic frame index across restarts, latest-slot cleared on stop,
+  sink under a dedicated lock (`set_sink(None)` is a barrier), Frame objects with
+  per-frame hw metadata.
+- **Recorder**: sidecars per recording (`_timestamps.npy`, `_hwclock.npz` with NaN
+  for missing hw timestamps, `.json` with sw/hw measured fps + genuine drops from
+  hw-counter gaps), duration/frame limits (flag-only; UI poll finalizes),
+  background encode via a recording state machine (idle→recording→encoding).
+- **Web app rebuilt**: generic control panel rendered from `/capabilities`
+  (normalized 0..1000 sliders, debounced, echo-resync, side-effect refresh);
+  **drag-ROI zoom** on the live stream (exact CSS-px transform, staleness gates,
+  applied-ROI adoption, stream reconnect per change), right-click = uniform undo
+  via a zoom stack, editable coordinate fields; recording UI with limits;
+  timelapse carried forward (incl. state restore). Pages in `camera_dock/static/`
+  derive their base from `window.location` (works standalone and mounted).
+  Data dirs anchored to the dock repo root (`paths.py`), never CWD.
+  `preview.py` removed (superseded; git history has it).
+- **Hardware-verified on CS165MU s/n 32943** [verified-run]: full frame 30 fps →
+  drag-zoom to 292×220 → fps range re-published 1–34.8 ⇒ 3.9–**149.1**, measured
+  149.1 fps; recorded 600 frames @ 149.3 fps, 0 drops, hw-clock sidecar valid
+  (6.708 ms mean Δ); right-click restored full frame with fps re-clamped to 34.8;
+  coupling clamped 100 ms exposure → 6.57 ms on fps=149 with warning; black_level
+  auto-registered (0–511); `pixel_clock` → clean 422; duration-limit auto-stop OK.
+  Panel contract verified against unmodified `xsphere_daq/panel.py`.
+
+**Next.** Port basler/ids/hayear drivers onto `CameraDriver` when they're needed
+again (feature matrix + porting notes in DESIGN.md); binning UI; integrate the
+eval server's features into the DAQ panel.
+
 ## 2026-06-12 — Web app: per-camera connect / disconnect at runtime
 
 **Context.** User needs to release a camera from the dock at runtime (to hand it to the

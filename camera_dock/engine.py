@@ -1,18 +1,24 @@
-"""Threaded acquisition engine — shared by the test GUIs, the dock, and the DAQ.
+"""Threaded acquisition engine — shared by the dock web app and the DAQ.
 
 Decouples frame *acquisition* from *display* and *recording*. A single producer
-thread pulls every frame from a :class:`~camera_dock.base.CameraBase` at the
-camera's full (no-drop) rate and distributes each frame to:
+thread pulls every :class:`~camera_dock.base.Frame` from a driver at the camera's
+full rate and distributes each frame to:
 
-* a **latest-frame slot** that the UI samples at its own, slower, preview rate —
-  so slow rendering never throttles capture; and
-* an optional **sink** (e.g. a :class:`~camera_dock.recorder.HybridRecorder`)
-  that receives *every* frame for recording at the full data rate.
+* a **latest-frame slot** the UI samples at its own, slower, preview rate — so
+  slow rendering never throttles capture; and
+* an optional **sink** (e.g. the recorder) that receives *every* frame.
 
-This is the piece that makes "record at the camera's maximum data rate while the
-live view runs at a comfortable ~30 fps" possible. It depends only on the
-``CameraBase`` surface, so it works for any camera and is reused unchanged by the
-dock and the DAQ.
+Concurrency contracts (docs/DESIGN.md §2.3):
+
+* ``_frame_index`` is monotonic across restarts — index-based freshness guards
+  (auto-exposure, timelapse stale detection) survive region changes.
+* ``stop()`` clears the latest slot, so a stale-geometry frame is never served
+  after a restart; it also stops the camera BEFORE joining (a disarm aborts a
+  grab blocked inside the SDK), and reports if the thread failed to join —
+  callers must not touch geometry while a producer might still be alive.
+* The sink is invoked under a dedicated ``_sink_lock`` and ``set_sink`` takes the
+  same lock, so ``set_sink(None)`` returning is a barrier: no ``submit`` is in
+  flight afterwards and none will start.
 """
 
 from __future__ import annotations
@@ -21,30 +27,25 @@ import threading
 from time import perf_counter, sleep
 from typing import Callable, Optional, Tuple
 
-import numpy as np
+from .base import Frame
 
-# A sink receives (frame, frame_index, timestamp_s). It must be cheap and
-# thread-safe — it runs on the acquisition thread and must not block it.
-Sink = Callable[[np.ndarray, int, float], None]
+# A sink receives (frame, frame_index, t_sw). It runs on the acquisition thread
+# and must be cheap (append/enqueue) — it must never block.
+Sink = Callable[[Frame, int, float], None]
 
 
 class AcquisitionEngine:
-    """Runs a camera's acquisition on a background thread.
-
-    Parameters
-    ----------
-    camera:
-        Any object satisfying :class:`~camera_dock.base.CameraBase`.
-    """
+    """Runs a driver's acquisition on a background thread."""
 
     def __init__(self, camera) -> None:
         self._cam = camera
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._lock = threading.Lock()
+        self._sink_lock = threading.Lock()
 
-        self._latest: Optional[np.ndarray] = None
-        self._frame_index = 0          # total frames acquired since start()
+        self._latest: Optional[Frame] = None
+        self._frame_index = 0          # monotonic across restarts (never reset)
         self._sink: Optional[Sink] = None
 
         self._acq_fps = 0.0
@@ -52,57 +53,61 @@ class AcquisitionEngine:
 
     # --- lifecycle ---------------------------------------------------------
     def start(self) -> None:
-        """Begin no-drop acquisition on a background thread."""
+        """Begin acquisition on a background thread (no-op if running)."""
         if self._running:
             return
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("previous acquisition thread still alive")
         self._cam.start(max_throughput=True)
         self._running = True
-        self._frame_index = 0
         self._thread = threading.Thread(target=self._loop, name="acquisition", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop acquisition and join the background thread.
+    def stop(self) -> bool:
+        """Stop acquisition; return True if the producer thread exited cleanly.
 
-        The camera is stopped *before* the join (mirroring the tested reference
-        GUIs' disarm-first discipline): stopping aborts a grab blocked inside
-        the SDK, so the thread exits within one poll chunk instead of waiting
-        out a full frame period — without this, a slow frame rate makes the
-        join time out and the thread outlive the engine.
+        Camera stopped BEFORE the join: stopping aborts a grab blocked inside
+        the SDK so the thread exits promptly. A False return means the thread is
+        wedged inside the SDK — callers must not proceed to geometry changes.
         """
         self._running = False
         try:
             self._cam.stop()
         except Exception:
             pass
+        joined = True
         if self._thread is not None:
             self._thread.join(timeout=3.0)
-            self._thread = None
+            joined = not self._thread.is_alive()
+            if joined:
+                self._thread = None
+        with self._lock:
+            self._latest = None       # never serve a stale-geometry frame
+        return joined
 
     def _loop(self) -> None:
         window_n, window_t0 = 0, perf_counter()
         while self._running:
             try:
-                frame = self._cam.grab()
+                frame = self._cam.grab(timeout_ms=2000)
             except Exception:
-                # A grab can fail transiently (timeout) or during shutdown.
                 if not self._running:
                     break
                 self._errors += 1
-                sleep(0.05)   # a fast-failing camera (unplugged) must not busy-spin
+                sleep(0.05)   # a fast-failing camera must not busy-spin
                 continue
 
-            t = perf_counter()
+            t = frame.meta.t_sw
             with self._lock:
                 self._latest = frame
                 self._frame_index += 1
                 index = self._frame_index
-                sink = self._sink
 
-            # Deliver to the recorder (if any) OUTSIDE the lock. The sink must be
-            # cheap (enqueue/append) so it never throttles acquisition.
-            if sink is not None:
-                sink(frame, index, t)
+            # Sink outside the frame lock but under the sink lock — set_sink(None)
+            # is then a barrier (no submit in flight after it returns).
+            with self._sink_lock:
+                if self._sink is not None:
+                    self._sink(frame, index, t)
 
             window_n += 1
             dt = t - window_t0
@@ -111,24 +116,19 @@ class AcquisitionEngine:
                 window_n, window_t0 = 0, t
 
     # --- consumer-facing ---------------------------------------------------
-    def latest(self) -> Tuple[Optional[np.ndarray], int]:
-        """Return the most recent ``(frame, frame_index)`` for preview.
-
-        ``frame`` is ``None`` until the first frame arrives. Frames are fresh
-        copies from the driver, so the returned array is safe to read without
-        further locking.
-        """
+    def latest(self) -> Tuple[Optional[Frame], int]:
+        """Most recent ``(frame, frame_index)``; frame is None until one arrives."""
         with self._lock:
             return self._latest, self._frame_index
 
     @property
     def acquisition_fps(self) -> float:
-        """Measured true acquisition rate (frames actually pulled per second)."""
+        """Measured true acquisition rate (from host-side frame deltas — the
+        SDK's own measurement returns 0.0 on some units)."""
         return self._acq_fps
 
     @property
     def error_count(self) -> int:
-        """Grab errors since start() — a growing count means the camera is unwell."""
         return self._errors
 
     @property
@@ -136,6 +136,6 @@ class AcquisitionEngine:
         return self._running
 
     def set_sink(self, sink: Optional[Sink]) -> None:
-        """Attach (or clear with ``None``) the per-frame recording sink."""
-        with self._lock:
+        """Attach (or clear with None) the per-frame sink. Clearing is a barrier."""
+        with self._sink_lock:
             self._sink = sink

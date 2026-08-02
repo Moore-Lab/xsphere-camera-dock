@@ -1,0 +1,43 @@
+/* xsphere camera dock — shared styles */
+body { margin:0; background:#111; color:#ddd; font-family:system-ui,sans-serif; font-size:14px; }
+header { padding:8px 14px; background:#000; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+header b { font-size:16px; }
+#info { color:#7f7; }
+a { color:#8cf; text-decoration:none; }
+a:hover { text-decoration:underline; }
+button { background:#264; color:#dfd; border:1px solid #486; border-radius:4px;
+         padding:6px 10px; cursor:pointer; }
+button:hover { background:#386; }
+button.rec { background:#622; color:#fdd; border-color:#a55; }
+button.rec.on { background:#a33; }
+input[type=text], input[type=number], select {
+  background:#222; color:#ddd; border:1px solid #444; border-radius:3px; padding:3px 5px; }
+input[type=range] { width:100%; }
+
+/* overview */
+.grid { display:flex; flex-wrap:wrap; gap:14px; padding:14px; }
+.card { background:#1a1a1a; border:1px solid #333; border-radius:6px; padding:8px; }
+.card img { display:block; max-width:46vw; height:auto; border:1px solid #333; }
+.card .cap { text-align:center; padding-top:6px; color:#7cf; }
+
+/* camera page */
+.main { display:flex; flex-wrap:wrap; gap:14px; padding:12px; align-items:flex-start; }
+.streambox { position:relative; width:min(72vw, 1080px); user-select:none; }
+.streambox img { display:block; width:100%; height:auto; border:1px solid #333;
+                 background:#000; min-height:120px; }
+#dragbox { position:absolute; border:1.5px dashed #4df; background:rgba(80,200,255,.12);
+           pointer-events:none; display:none; }
+.hint { color:#667; font-size:12px; padding-top:4px; }
+.panel { min-width:300px; max-width:360px; background:#1a1a1a; border:1px solid #333;
+         border-radius:6px; padding:12px; flex:1; }
+.row { margin:10px 0; }
+.row label { display:block; margin-bottom:3px; color:#aaa; }
+.row .val { color:#7cf; float:right; }
+.ctlrow input[type=text] { width:88px; }
+.roi-fields input { width:56px; }
+#stat { color:#fc7; margin-top:8px; min-height:1.2em; word-break:break-all; }
+#toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%);
+         background:#432; color:#fda; border:1px solid #a75; border-radius:6px;
+         padding:8px 14px; display:none; z-index:10; }
+.small { color:#888; font-size:12px; }
+.tl-stat { color:#7cf; font-size:12px; margin-top:4px; word-break:break-all; }

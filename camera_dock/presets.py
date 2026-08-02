@@ -16,6 +16,8 @@ import json
 import os
 from typing import List
 
+from .paths import data_dir
+
 
 def capture(camera, *, has_roi: bool) -> dict:
     """Snapshot the current settings of ``camera`` into a plain dict."""
@@ -73,9 +75,7 @@ def apply(camera, settings: dict, *, set_roi: bool = True) -> None:
 
 
 def _dir() -> str:
-    d = os.path.join(os.getcwd(), "presets")
-    os.makedirs(d, exist_ok=True)
-    return d
+    return data_dir("presets")   # dock-repo-anchored, never CWD (see paths.py)
 
 
 def _safe(name: str) -> str:

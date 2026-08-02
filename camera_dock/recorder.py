@@ -1,25 +1,23 @@
 """Hybrid recorder — capture at the camera's full data rate, encode afterwards.
 
-Recording video at a camera's maximum frame rate is bottlenecked by per-frame
-*encoding* (FFV1/MJPG on the CPU) if you encode in the acquisition hot path. This
-recorder removes encoding from that path entirely:
+Recording at a camera's maximum rate is bottlenecked by per-frame *encoding* if
+you encode in the acquisition hot path. This recorder removes encoding from that
+path entirely:
 
-1. **Capture** (hot path, called from the acquisition thread): each frame is just
-   appended to a RAM buffer. No encode, no disk — so acquisition runs at the
-   sensor's full rate with no dropped frames.
-2. **Spill** (only for long clips): once the RAM buffer passes a size cap, further
-   frames stream to a raw file via a background writer thread with a bounded queue.
-   The queue depth is the "few seconds of latency" that absorbs disk jitter; if it
-   ever overflows (disk can't keep up at all), the overflow is *counted*, not
-   silently lost.
-3. **Encode** (after you press stop): the buffered + spilled frames are written to
-   a lossless video file. This is where the few-seconds delay is spent — off the
-   capture path, so it never costs you frame rate.
+1. **Capture** (hot path, acquisition thread): each frame is appended to a RAM
+   buffer, its metadata (host time, hardware frame counter/timestamp) to
+   parallel index-aligned lists. No encode, no disk.
+2. **Spill** (long clips only): past a RAM cap, frames stream to a raw file via
+   a background writer with a bounded queue; overflow is *counted*, never
+   silently lost, and never blocks acquisition.
+3. **Encode** (after stop): everything is written to a lossless video, and the
+   metadata sidecars (timestamps / hwclock / json — see metadata.py) are written
+   next to it. This is minutes of work for long clips — the web app runs it on a
+   dedicated non-daemon thread, never in the capture path or a request handler.
 
-Camera-agnostic: it stores whatever 2-D ``numpy`` frames the engine feeds it and
-uses a caller-supplied ``to_8bit`` to convert for the 8-bit video at encode time
-(so 16-bit cameras work too). Built for reuse by the test GUIs, the dock, and the
-DAQ.
+Optional limits (``max_frames`` / ``max_seconds``): when reached the recorder
+just stops *accepting* frames and raises its ``limit_reached`` flag — no
+cross-thread finalization; the UI poll sees the flag and calls stop.
 """
 
 from __future__ import annotations
@@ -28,40 +26,46 @@ import os
 import queue
 import threading
 from datetime import datetime, timedelta
-from time import perf_counter
+from time import perf_counter, time as unix_time
 from typing import Callable, Optional
 
 import cv2
 import numpy as np
 
-# Convert a native mono frame (uint8 or uint16) to a uint8 2-D array for video.
+from . import metadata
+from .base import Frame
+
+# Convert a native mono frame (uint8/uint16) to a uint8 2-D array for video.
 To8Bit = Callable[[np.ndarray], np.ndarray]
-# Burn an overlay (e.g. a timestamp) onto a BGR frame, given that frame's wall time.
+# Burn an overlay (e.g. a timestamp) onto a BGR frame, given its wall time.
 Stamp = Callable[[np.ndarray, datetime], None]
 
 
 class HybridRecorder:
-    """Buffer frames at full rate, optionally spilling to disk, encode on stop.
-
-    Parameters
-    ----------
-    ram_cap_bytes:
-        Soft cap on RAM held before spilling subsequent frames to a raw file.
-    queue_frames:
-        Bounded spill-queue depth (the latency buffer). Overflow is counted.
-    """
+    """Buffer frames at full rate, spill past a RAM cap, encode + sidecars on stop."""
 
     def __init__(
         self,
         ram_cap_bytes: int = 2_000_000_000,
         queue_frames: int = 256,
         clock: Optional[Callable[[], datetime]] = None,
+        max_frames: int = 0,             # 0 = unlimited
+        max_seconds: float = 0.0,        # 0 = unlimited
     ) -> None:
         self.ram_cap_bytes = int(ram_cap_bytes)
-        self._clock = clock          # returns the current wall time (e.g. New Haven)
-        self._times: list[float] = []  # per-frame perf timestamps, in capture order
+        self.max_frames = int(max_frames)
+        self.max_seconds = float(max_seconds)
+        self.limit_reached = False
+        self._clock = clock
+
+        # Parallel, index-aligned per-frame metadata (RAM + spilled frames).
+        self._times: list[float] = []
+        self._hw_counts: list[Optional[int]] = []
+        self._hw_ts: list[Optional[float]] = []
+
         self._t0_perf: Optional[float] = None
         self._t0_wall: Optional[datetime] = None
+        self._start_unix: Optional[float] = None
         self._ram: list[np.ndarray] = []
         self._ram_bytes = 0
 
@@ -80,42 +84,61 @@ class HybridRecorder:
         self._t_last: Optional[float] = None
         self._closed = False
 
+    @property
+    def captured(self) -> int:
+        return self._captured
+
+    @property
+    def elapsed_s(self) -> float:
+        if self._t_first is None:
+            return 0.0
+        return (self._t_last or self._t_first) - self._t_first
+
     # --- hot path (acquisition thread) ------------------------------------
-    def submit(self, frame: np.ndarray, index: int, t: float) -> None:
+    def submit(self, frame: Frame, index: int, t: float) -> None:
         """Accept one frame. Cheap: RAM append, or non-blocking enqueue if spilling."""
-        if self._closed:
+        if self._closed or self.limit_reached:
             return
+        data, meta = frame.data, frame.meta
         if self._shape is None:
-            self._shape, self._dtype = frame.shape, frame.dtype
+            self._shape, self._dtype = data.shape, data.dtype
             self._t_first = t
             self._t0_perf = t
+            self._start_unix = unix_time()
             if self._clock is not None:
-                self._t0_wall = self._clock()   # anchor wall time to this first frame
+                self._t0_wall = self._clock()   # wall time anchored to first frame
+        elif data.shape != self._shape:
+            return                              # stale-geometry frame — never record
         self._t_last = t
-        self._times.append(t)                   # tiny; kept for every frame even if spilled
+        self._times.append(t)
+        self._hw_counts.append(meta.hw_count)
+        self._hw_ts.append(meta.hw_timestamp_ns)
         self._captured += 1
 
+        if ((self.max_frames and self._captured >= self.max_frames)
+                or (self.max_seconds and t - self._t_first >= self.max_seconds)):
+            self.limit_reached = True           # stop accepting; UI poll finalizes
+
         if not self._spilling and self._ram_bytes < self.ram_cap_bytes:
-            self._ram.append(frame)
-            self._ram_bytes += frame.nbytes
+            self._ram.append(data)
+            self._ram_bytes += data.nbytes
             return
 
-        # Over the RAM cap: stream to disk via the writer thread.
         if not self._spilling:
             self._begin_spill()
         try:
-            self._queue.put_nowait(frame)
+            self._queue.put_nowait(data)
         except queue.Full:
             self._dropped += 1
 
     # --- spill writer ------------------------------------------------------
-    def _begin_spill(self, path: Optional[str] = None) -> None:
+    def _begin_spill(self) -> None:
         self._spilling = True
-        self._spill_path = path or os.path.join(
-            os.environ.get("TEMP", "."), f"_xsphere_spill_{id(self)}.raw"
-        )
+        self._spill_path = os.path.join(
+            os.environ.get("TEMP", "."), f"_xsphere_spill_{id(self)}.raw")
         self._spill_file = open(self._spill_path, "wb")
-        self._writer_thread = threading.Thread(target=self._writer_loop, name="spill-writer", daemon=True)
+        self._writer_thread = threading.Thread(target=self._writer_loop,
+                                               name="spill-writer", daemon=True)
         self._writer_thread.start()
 
     def _writer_loop(self) -> None:
@@ -126,19 +149,18 @@ class HybridRecorder:
             self._spill_file.write(np.ascontiguousarray(item).tobytes())
             self._spilled += 1
 
-    # --- finalize ----------------------------------------------------------
+    # --- finalize (dedicated encode thread; never the capture path) --------
     def stop_and_encode(self, path: str, fps: float, to_8bit: To8Bit,
-                        stamp: Optional[Stamp] = None) -> dict:
-        """Stop accepting frames and encode everything to a lossless video.
+                        stamp: Optional[Stamp] = None,
+                        camera: Optional[dict] = None) -> dict:
+        """Stop accepting frames, encode to a lossless video, write sidecars.
 
-        Call only after the engine's sink has been detached (no more ``submit``).
-        If ``stamp`` is given, each frame is annotated with its own capture-time
-        wall clock (anchored at the first frame) — burning the timestamp into the
-        movie. Returns a stats dict. ``path`` should end in ``.avi``.
+        Call only after the engine's sink has been detached (set_sink(None) is a
+        barrier — no submit is in flight afterwards).
         """
         self._closed = True
+        stop_unix = unix_time()
 
-        # Drain and close the spill writer, if any.
         if self._spilling:
             self._queue.put(None)
             if self._writer_thread is not None:
@@ -151,36 +173,59 @@ class HybridRecorder:
 
         encode_t0 = perf_counter()
         encoded = 0
+        ok = False
         if self._shape is not None:
             h, w = self._shape
             writer = _open_writer(path, fps, (w, h))
-            if writer is None:
-                return self._stats(path, capture_fps, capture_seconds, 0.0, encoded, ok=False)
-            try:
-                for frame in self._ram:
-                    self._write_frame(writer, frame, to_8bit, stamp, encoded)
-                    encoded += 1
-                encoded += self._encode_spill(writer, to_8bit, stamp, encoded)
-            finally:
-                writer.release()
+            if writer is not None:
+                try:
+                    for data in self._ram:
+                        self._write_frame(writer, data, to_8bit, stamp, encoded)
+                        encoded += 1
+                    encoded += self._encode_spill(writer, to_8bit, stamp, encoded)
+                    ok = True
+                finally:
+                    writer.release()
 
-        # Clean up the raw spill file.
         if self._spill_path and os.path.exists(self._spill_path):
             try:
                 os.remove(self._spill_path)
             except OSError:
                 pass
 
-        return self._stats(path, capture_fps, capture_seconds, perf_counter() - encode_t0, encoded, ok=True)
+        sidecar = None
+        if ok and self._shape is not None:
+            h, w = self._shape
+            sidecar = metadata.write_sidecars(
+                path, t_sw=self._times, hw_counts=self._hw_counts,
+                hw_ts_ns=self._hw_ts, camera=camera, width=w, height=h,
+                nominal_fps=fps, start_unix=self._start_unix, stop_unix=stop_unix,
+                extra={"ram_frames": len(self._ram), "spilled": self._spilled})
 
-    def _write_frame(self, writer, frame, to_8bit: To8Bit, stamp: Optional[Stamp], idx: int) -> None:
-        bgr = cv2.cvtColor(to_8bit(frame), cv2.COLOR_GRAY2BGR)
+        return {
+            "ok": ok,
+            "path": path if ok else None,
+            "sidecar": sidecar,
+            "captured": self._captured,
+            "encoded": encoded,
+            "dropped": self._dropped,
+            "spilled": self._spilled,
+            "limit_reached": self.limit_reached,
+            "capture_fps": round(capture_fps, 1),
+            "capture_seconds": round(capture_seconds, 3),
+            "encode_seconds": round(perf_counter() - encode_t0, 3),
+        }
+
+    def _write_frame(self, writer, data, to_8bit: To8Bit, stamp: Optional[Stamp],
+                     idx: int) -> None:
+        bgr = cv2.cvtColor(to_8bit(data), cv2.COLOR_GRAY2BGR)
         if stamp is not None and self._t0_wall is not None and idx < len(self._times):
             dt = self._t0_wall + timedelta(seconds=self._times[idx] - self._t0_perf)
             stamp(bgr, dt)
         writer.write(bgr)
 
-    def _encode_spill(self, writer, to_8bit: To8Bit, stamp: Optional[Stamp], start_idx: int) -> int:
+    def _encode_spill(self, writer, to_8bit: To8Bit, stamp: Optional[Stamp],
+                      start_idx: int) -> int:
         if not self._spilling or not self._spill_path or not os.path.exists(self._spill_path):
             return 0
         n = 0
@@ -190,23 +235,10 @@ class HybridRecorder:
                 raw = f.read(frame_bytes)
                 if len(raw) < frame_bytes:
                     break
-                frame = np.frombuffer(raw, dtype=self._dtype).reshape(self._shape)
-                self._write_frame(writer, frame, to_8bit, stamp, start_idx + n)
+                data = np.frombuffer(raw, dtype=self._dtype).reshape(self._shape)
+                self._write_frame(writer, data, to_8bit, stamp, start_idx + n)
                 n += 1
         return n
-
-    def _stats(self, path, capture_fps, capture_seconds, encode_seconds, encoded, ok) -> dict:
-        return {
-            "ok": ok,
-            "path": path if ok else None,
-            "captured": self._captured,
-            "encoded": encoded,
-            "dropped": self._dropped,
-            "spilled": self._spilled,
-            "capture_fps": round(capture_fps, 1),
-            "capture_seconds": round(capture_seconds, 3),
-            "encode_seconds": round(encode_seconds, 3),
-        }
 
 
 def _open_writer(path: str, fps: float, size):

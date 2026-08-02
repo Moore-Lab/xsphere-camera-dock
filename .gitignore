@@ -13,15 +13,24 @@ env/
 captures/
 recordings/
 presets/
+# ...but keep the recordings/ folder (and its README) in the tree
+!recordings/
+recordings/*
+!recordings/.gitkeep
+!recordings/README.md
 *.tiff
 *.tif
 *.avi
 *.mp4
 *.raw
 *.npy
+*.npz
 
 # IDE / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Claude Code local tooling
+.claude/

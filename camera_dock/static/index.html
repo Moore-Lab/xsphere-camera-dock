@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>xsphere camera dock</title>
+<link rel="stylesheet" href="static/dock.css">
+</head>
+<body>
+<header><b>xsphere camera dock</b> &mdash; live streams</header>
+<div class="grid" id="grid"></div>
+<script>
+// API base = wherever this page is mounted (works standalone and under /cameras/).
+const BASE = location.pathname.replace(/\/$/, '');
+async function load() {
+  const cams = await (await fetch(BASE + '/cameras')).json();
+  document.getElementById('grid').innerHTML = cams.map(c => `
+    <div class="card">
+      <a href="${BASE}/cam/${c.name}">
+        ${c.ok ? `<img src="${BASE}/cam/${c.name}/stream">` : ''}
+      </a>
+      <div class="cap"><a href="${BASE}/cam/${c.name}">${c.name}</a>${
+        c.ok ? '' : ' (unavailable' + (c.error ? ': ' + c.error : '') + ')'}</div>
+    </div>`).join('');
+}
+load();
+</script>
+</body></html>

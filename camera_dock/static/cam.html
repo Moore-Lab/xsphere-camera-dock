@@ -1,0 +1,63 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>camera</title>
+<link rel="stylesheet" href="../static/dock.css">
+</head>
+<body>
+<header>
+  <a id="rootlink" href="#">&larr; all cameras</a>
+  <b id="title">camera</b>
+  <span id="info">connecting…</span>
+  <button id="conn">disconnect</button>
+</header>
+<div class="main">
+  <div>
+    <div class="streambox" id="streambox">
+      <img id="stream" draggable="false" alt="camera stream">
+      <div id="dragbox"></div>
+    </div>
+    <div class="hint">drag: zoom to region (sensor ROI) &nbsp;·&nbsp; right-click:
+      step back out &nbsp;·&nbsp; fps rises as the region shrinks</div>
+  </div>
+  <div class="panel">
+    <div id="controls"></div>
+    <div class="row">
+      <button id="autoexp">auto-exposure</button>
+      <button id="snap">snapshot</button>
+      <select id="snap-fmt"><option>tiff</option><option>png</option><option>npy</option></select>
+      <label style="display:inline"><input type="checkbox" id="hist"> histogram</label>
+    </div>
+    <div class="row roi-fields" id="roi-row">
+      <label>sensor ROI &nbsp;x, y, w, h <span class="val" id="roi-eff"></span></label>
+      <input id="roi-x" type="text"> <input id="roi-y" type="text">
+      <input id="roi-w" type="text"> <input id="roi-h" type="text">
+      <button id="roi-apply">apply</button> <button id="roi-full">full frame</button>
+    </div>
+    <div class="row" id="rec-row">
+      <label>recording <span class="val" id="rec-info"></span></label>
+      limit <input id="rec-sec" type="text" style="width:48px" placeholder="s"> s /
+      <input id="rec-frames" type="text" style="width:64px" placeholder="frames"> frames
+      <span class="small">(blank = unlimited)</span>
+      <div style="margin-top:5px"><button id="rec" class="rec">&#9679; record</button></div>
+    </div>
+    <div class="row" id="tl-row">
+      <label>timelapse (interval stills)</label>
+      every <input type="text" id="tl-int" value="30" style="width:44px"> s &nbsp;
+      for <input type="text" id="tl-hrs" value="10" style="width:44px"> h
+      <select id="tl-fmt"><option>tiff</option><option>png</option><option>npy</option></select>
+      <div style="margin-top:5px"><input type="text" id="tl-dir" style="width:100%"
+        placeholder="save folder (blank = captures/timelapse_...)"></div>
+      <div style="margin-top:5px"><button id="tl-btn">&#9654; start timelapse</button>
+        <span class="small">0 h = until stopped</span></div>
+      <div id="tl-stat" class="tl-stat"></div>
+    </div>
+    <div class="row">
+      <label>preset</label>
+      <input type="text" id="pname" placeholder="name" list="plist"><datalist id="plist"></datalist>
+      <button id="psave">save</button> <button id="pload">load</button>
+    </div>
+    <div id="stat"></div>
+  </div>
+</div>
+<div id="toast"></div>
+<script src="../static/cam.js"></script>
+</body></html>
