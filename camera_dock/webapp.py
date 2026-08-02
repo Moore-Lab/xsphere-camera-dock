@@ -586,6 +586,10 @@ def create_app(sessions: dict, *, manage_lifecycle: bool = True):
             raise HTTPException(404)
         return FileResponse(path)
 
+    @app.get("/favicon.ico")
+    def favicon():
+        return FileResponse(os.path.join(_STATIC, "xsphere.ico"))
+
     @app.get("/cam/{name}")
     def cam_page(name: str):
         if name not in sessions:
