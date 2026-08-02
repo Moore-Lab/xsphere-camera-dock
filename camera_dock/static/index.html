@@ -2,6 +2,15 @@
 <html><head><meta charset="utf-8"><title>xsphere camera dock</title>
 <link rel="stylesheet" href="static/dock.css">
 <link rel="icon" type="image/x-icon" href="static/xsphere.ico">
+<style>
+  .card { min-width: 240px; }
+  .card .statusline { color:#8a8; font-size:12px; padding-top:4px; min-height:1.1em;
+                      max-width:46vw; word-break:break-word; }
+  .card .statusline.err { color:#c77; }
+  .card .bar { display:flex; align-items:center; gap:8px; padding-top:6px; }
+  .card .noimg { display:flex; align-items:center; justify-content:center;
+                 width:320px; height:200px; border:1px dashed #333; color:#555; }
+</style>
 </head>
 <body>
 <header><b>xsphere camera dock</b> &mdash; live streams</header>
@@ -9,17 +18,86 @@
 <script>
 // API base = wherever this page is mounted (works standalone and under /cameras/).
 const BASE = location.pathname.replace(/\/$/, '');
-async function load() {
-  const cams = await (await fetch(BASE + '/cameras')).json();
-  document.getElementById('grid').innerHTML = cams.map(c => `
-    <div class="card">
-      <a href="${BASE}/cam/${c.name}">
-        ${c.ok ? `<img src="${BASE}/cam/${c.name}/stream">` : ''}
-      </a>
-      <div class="cap"><a href="${BASE}/cam/${c.name}">${c.name}</a>${
-        c.ok ? '' : ' (unavailable' + (c.error ? ': ' + c.error : '') + ')'}</div>
-    </div>`).join('');
+const cards = {};   // name -> {root, img, status, btn, ok}
+
+function makeCard(c) {
+  const root = document.createElement('div');
+  root.className = 'card';
+  root.innerHTML = `
+    <a href="${BASE}/cam/${c.name}"><span class="imgslot"></span></a>
+    <div class="bar">
+      <a class="cap" href="${BASE}/cam/${c.name}">${c.name}</a>
+      <span style="flex:1"></span>
+      <button class="connbtn"></button>
+    </div>
+    <div class="statusline"></div>`;
+  const card = {
+    root,
+    slot: root.querySelector('.imgslot'),
+    status: root.querySelector('.statusline'),
+    btn: root.querySelector('.connbtn'),
+    ok: null,          // unknown -> update() always redraws first time
+  };
+  card.btn.onclick = async () => {
+    card.btn.disabled = true;
+    card.status.classList.remove('err');
+    card.status.textContent = card.ok ? 'disconnecting…' : 'connecting…';
+    try {
+      const r = await fetch(`${BASE}/cam/${c.name}/${card.ok ? 'disconnect' : 'connect'}`,
+                            { method: 'POST' });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        card.status.classList.add('err');
+        card.status.textContent = j.detail || `error ${r.status}`;
+        card.errUntil = Date.now() + 4000;   // hold the message across refreshes
+      }
+    } finally {
+      card.btn.disabled = false;
+      refresh();
+    }
+  };
+  return card;
 }
-load();
+
+function update(card, c) {
+  // Swap the stream <img> only when connectivity actually changes — recreating
+  // it every poll would reconnect the MJPEG stream each time.
+  if (card.ok !== c.ok) {
+    card.ok = c.ok;
+    card.slot.innerHTML = c.ok
+      ? `<img src="${BASE}/cam/${c.name}/stream?e=${Date.now()}">`
+      : `<div class="noimg">disconnected</div>`;
+    card.btn.textContent = c.ok ? 'disconnect' : 'connect';
+  }
+  if (card.errUntil && Date.now() < card.errUntil) return;  // let errors be read
+  const parts = [];
+  if (c.ok) {
+    if (c.model) parts.push(`${c.model} s/n ${c.serial}`);
+    parts.push(`${c.width}×${c.height}`, `acq ${c.acquisition_fps.toFixed(1)} fps`);
+    if (c.rec_state && c.rec_state !== 'idle') parts.push(c.rec_state.toUpperCase());
+    if (c.timelapse_running) parts.push('TIMELAPSE');
+    card.status.classList.remove('err');
+    card.status.textContent = parts.join(' · ');
+  } else if (!card.status.classList.contains('err')) {
+    card.status.textContent = c.error || 'disconnected';
+  }
+}
+
+async function refresh() {
+  let cams;
+  try { cams = await (await fetch(BASE + '/cameras')).json(); }
+  catch (e) { return; }
+  const grid = document.getElementById('grid');
+  for (const c of cams) {
+    if (!cards[c.name]) {
+      cards[c.name] = makeCard(c);
+      grid.appendChild(cards[c.name].root);
+    }
+    update(cards[c.name], c);
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
 </script>
 </body></html>
