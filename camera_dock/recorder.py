@@ -17,13 +17,17 @@ path entirely:
 
 Optional limits (``max_frames`` / ``max_seconds``): when reached the recorder
 just stops *accepting* frames and raises its ``limit_reached`` flag — no
-cross-thread finalization; the UI poll sees the flag and calls stop.
+cross-thread finalization from the hot path. The session's limit watchdog
+(``CameraSession._start_limit_watchdog``) sees the flag and calls stop. It used
+to be the browser poll that did this, which meant a limited recording never
+finalized unless its camera page happened to be open.
 """
 
 from __future__ import annotations
 
 import os
 import queue
+import tempfile
 import threading
 from datetime import datetime, timedelta
 from time import perf_counter, time as unix_time
@@ -117,7 +121,7 @@ class HybridRecorder:
 
         if ((self.max_frames and self._captured >= self.max_frames)
                 or (self.max_seconds and t - self._t_first >= self.max_seconds)):
-            self.limit_reached = True           # stop accepting; UI poll finalizes
+            self.limit_reached = True           # stop accepting; watchdog finalizes
 
         if not self._spilling and self._ram_bytes < self.ram_cap_bytes:
             self._ram.append(data)
@@ -135,7 +139,10 @@ class HybridRecorder:
     def _begin_spill(self) -> None:
         self._spilling = True
         self._spill_path = os.path.join(
-            os.environ.get("TEMP", "."), f"_xsphere_spill_{id(self)}.raw")
+            # gettempdir(), not $TEMP: TEMP is a Windows variable, so on Linux the
+            # old fallback was "." — multi-GB spill files into the working
+            # directory (the repo root, the way the panel is launched).
+            tempfile.gettempdir(), f"_xsphere_spill_{id(self)}.raw")
         self._spill_file = open(self._spill_path, "wb")
         self._writer_thread = threading.Thread(target=self._writer_loop,
                                                name="spill-writer", daemon=True)

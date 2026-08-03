@@ -253,11 +253,26 @@ class CameraSession:
 
     def stop(self) -> None:
         """Release the camera (engine + disconnect). Joins a running encode."""
+        try:
+            self.begin_stop()
+        finally:
+            self.join_encode()            # even if disconnect raised — the file matters
+
+    def begin_stop(self) -> None:
+        """Stop acquiring and hand any recording to the encode thread.
+
+        Returns as soon as *this* camera is released — it does not wait for the
+        encode. Split out from ``stop`` so a multi-camera teardown can stop every
+        camera first and only then wait (see ``stop_all``).
+        """
         with self.lock:
             self._stop_locked()
+
+    def join_encode(self, timeout: float = 600.0) -> None:
+        """Wait for a handed-off encode to finish writing its file."""
         t = self._encode_thread
         if t is not None:
-            t.join(timeout=600.0)         # finalize the file (non-daemon backstop)
+            t.join(timeout=timeout)       # finalize the file (non-daemon backstop)
 
     def _stop_locked(self) -> None:
         if not self.ok:
@@ -269,8 +284,26 @@ class CameraSession:
                 self.timelapse = None
             self.engine.set_sink(None)
             if self.rec_state == "recording":
-                self.rec_state = "idle"    # frames stop; no encode on teardown
+                # DELIBERATE: teardown does NOT encode. Ctrl+C is an instant kill
+                # so the rig always comes down promptly; encoding a long recording
+                # here would block shutdown for minutes. Finish a recording on
+                # purpose instead — "stop all" in the panel, or "shut down"
+                # (webapp.finalize_recordings), both of which encode first.
+                # Say loudly what is being dropped: silence here is what made this
+                # a data-loss bug the first time round.
+                rec = self.recorder
+                n = rec.captured if rec is not None else 0
+                self.rec_state = "idle"
                 self.recorder = None
+                print(f"[{self.name}] ABORTED recording on shutdown — {n} captured "
+                      f"frame(s) discarded, no file written "
+                      f"({os.path.basename(self.rec_path or '?')})", flush=True)
+                spill = getattr(rec, "_spill_path", None)
+                if spill and os.path.exists(spill):
+                    # Raw frames are still on disk; stop_and_encode (which would
+                    # have removed it) never ran. Name it rather than leaving a
+                    # multi-GB orphan nobody knows about.
+                    print(f"[{self.name}] raw spill left at {spill}", flush=True)
             self.engine.stop()
             self.camera.disconnect()
         finally:
@@ -419,6 +452,7 @@ class CameraSession:
                 self.engine.set_sink(None)
                 self.recorder, self.rec_state = None, "idle"
                 raise
+            self._start_limit_watchdog(rec)           # server finalizes at the limit
             return {"rec_state": "recording", "path": path}
 
     def record_stop(self) -> dict:
@@ -426,35 +460,94 @@ class CameraSession:
             if self.rec_state != "recording":
                 raise _Conflict(f"recorder is {self.rec_state}")
             self.engine.set_sink(None)                # barrier: no submit in flight
-            rec, path = self.recorder, self.rec_path
-            self.recorder = None
-            self.rec_state = "encoding"
-            fps = self.engine.acquisition_fps or (self.camera.get("fps").value or 30.0)
-            try:
-                cam_info = self.camera.device_info
-            except Exception:
-                cam_info = {"name": self.name}
-            t = threading.Thread(target=self._encode_worker,
-                                 args=(rec, path, float(fps), cam_info),
-                                 name="encode", daemon=False)
-            self._encode_thread = t
-            t.start()
+            path = self._begin_encode_locked()
         return {"rec_state": "encoding", "path": path}
 
-    def _encode_worker(self, rec: HybridRecorder, path: str, fps: float,
-                       cam_info: dict) -> None:
-        # Record the active pixel scale + geometry so analysis can convert to
-        # micrometres later without re-deriving the calibration.
-        extra = {}
+    def _recording_extra(self) -> dict:
+        """Pixel scale + geometry for the sidecar, read while the camera is alive.
+
+        Gathered by the caller rather than the encode thread: teardown hands the
+        recording to that thread and then disconnects, so anything read there
+        would come back empty exactly when a recording is being rescued.
+        Each probe stands alone — a missing calibration must not cost the ROI.
+        """
+        extra: dict = {}
         try:
             cal = calibration.active(self.name)
             if cal:
                 extra["um_per_px"] = cal["um_per_px"]
                 extra["calibration"] = cal.get("name")
+        except Exception:
+            pass
+        try:
             extra["roi"] = list(self.camera.get_roi()) if self.has_roi else None
+        except Exception:
+            pass
+        try:
             extra["binning"] = list(self.camera.get_binning())
         except Exception:
             pass
+        return extra
+
+    def _begin_encode_locked(self) -> str:
+        """Hand the current recording to the encode thread; return its path.
+
+        The caller holds the lock and has already detached the sink — that is
+        the barrier `stop_and_encode` requires. Shared by the three ways a
+        recording ends: the operator stops it, it hits its limit, or the rig is
+        being torn down.
+        """
+        rec, path = self.recorder, self.rec_path
+        self.recorder = None
+        self.rec_state = "encoding"
+        try:
+            fps = self.engine.acquisition_fps or (self.camera.get("fps").value or 30.0)
+        except Exception:
+            fps = 30.0
+        try:
+            cam_info = self.camera.device_info
+        except Exception:
+            cam_info = {"name": self.name}
+        t = threading.Thread(
+            target=self._encode_worker,
+            args=(rec, path, float(fps or 30.0), cam_info, self._recording_extra()),
+            name="encode", daemon=False)
+        self._encode_thread = t
+        t.start()
+        return path
+
+    def _start_limit_watchdog(self, rec: HybridRecorder) -> None:
+        """Finalize a limited recording without needing a browser.
+
+        max_seconds/max_frames make the recorder stop *accepting* frames and
+        raise ``limit_reached``; something must still call stop. That used to be
+        the camera page's poll (cam.js), so a limited recording only finalized
+        while its tab happened to be open — and the DAQ panel mounts camera
+        panes lazily, so switching tabs or reloading stranded the recording in
+        `recording` forever, holding RAM and an un-encoded spill file. The
+        server owns it now; the browser call is harmless redundancy (it 409s
+        once the state is `encoding`).
+        """
+        if not (rec.max_frames or rec.max_seconds):
+            return                                # unlimited: nothing to wait for
+
+        def watch() -> None:
+            while True:
+                sleep(0.2)
+                with self.lock:
+                    if self.recorder is not rec or self.rec_state != "recording":
+                        return                    # stopped by hand, or torn down
+                    if not rec.limit_reached:
+                        continue
+                    self.engine.set_sink(None)    # barrier, as in record_stop
+                    self._begin_encode_locked()
+                    return
+
+        threading.Thread(target=watch, name=f"rec-limit-{self.name}",
+                         daemon=True).start()
+
+    def _encode_worker(self, rec: HybridRecorder, path: str, fps: float,
+                       cam_info: dict, extra: dict) -> None:
         try:
             stats = rec.stop_and_encode(path, fps, self.to8,
                                         stamp=imaging.draw_timestamp, camera=cam_info,
@@ -556,13 +649,56 @@ def start_all(sessions: dict) -> None:
             s.ok, s.error = False, str(exc)
 
 
-def stop_all(sessions: dict) -> None:
-    """Stop every session; one bad disconnect never skips the rest."""
+def finalize_recordings(sessions: dict, timeout: float = 600.0) -> list:
+    """Stop and ENCODE every running recording. The graceful path.
+
+    Teardown itself is an instant kill that discards captured frames (see
+    ``_stop_locked``), so anything that wants files on disk must come through
+    here first: the panel's "stop all" and "shut down" controls, or a deliberate
+    per-camera stop. Two passes for the same reason ``stop_all`` uses two — every
+    camera must stop capturing before any encode is waited on, or the clips stop
+    being co-terminal and cameras 2..N keep spilling through camera 1's encode.
+
+    Never raises. Returns the names of the cameras that were finalized.
+    """
+    finalized = []
     for s in sessions.values():
         try:
-            s.stop()
+            if s.rec_state == "recording":
+                s.record_stop()               # detach sink + spawn the encode
+                finalized.append(s.name)
         except Exception as exc:
             s.error = str(exc)
+            print(f"[{s.name}] could not stop recording: {exc}", flush=True)
+    for s in sessions.values():
+        try:
+            s.join_encode(timeout=timeout)    # then wait for the files
+        except Exception as exc:
+            s.error = str(exc)
+            print(f"[{s.name}] error finalizing recording: {exc}", flush=True)
+    return finalized
+
+
+def stop_all(sessions: dict) -> None:
+    """Stop every session; one bad disconnect never skips the rest.
+
+    Fast: teardown does not encode, so this returns promptly even mid-recording
+    (those frames are discarded — see ``_stop_locked``). Still two passes,
+    because an encode started deliberately *before* shutdown may be in flight,
+    and waiting on it must not leave the other cameras capturing meanwhile.
+    """
+    for s in sessions.values():
+        try:
+            s.begin_stop()                # pass 1: everything stops acquiring
+        except Exception as exc:
+            s.error = str(exc)
+            print(f"[{s.name}] error during stop: {exc}", flush=True)
+    for s in sessions.values():
+        try:
+            s.join_encode()               # pass 2: wait for the files
+        except Exception as exc:
+            s.error = str(exc)
+            print(f"[{s.name}] error finalizing recording: {exc}", flush=True)
 
 
 def create_app(sessions: dict, *, manage_lifecycle: bool = True):

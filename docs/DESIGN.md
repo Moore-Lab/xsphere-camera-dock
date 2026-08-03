@@ -236,8 +236,20 @@ New/changed:
   (409 unless recording): `set_sink(None)` (barrier), state=encoding, spawn **non-daemon** encode
   thread; encode runs without the lock (never touches the camera); on completion stores stats,
   state=idle. `/record/status` polls state+stats. Disconnect/shutdown joins the encode thread.
-  Optional frame/duration limits: the recorder just stops *accepting* at the limit and flags
-  `limit_reached`; the UI poll sees it and calls stop — no cross-thread finalization.
+  Both ways a recording is *finished* (operator stop, limit reached) funnel through
+  `_begin_encode_locked`, which snapshots the sidecar `extra` **before** the camera can be
+  disconnected. Optional frame/duration limits: the recorder just stops *accepting* at the limit
+  and flags `limit_reached`; a per-recording watchdog thread sees it and calls stop — no
+  cross-thread finalization from the hot path, and **no dependence on an open browser**.
+- **Two shutdown modes, deliberately.** `stop_all` (what Ctrl+C and lifespan shutdown run) is an
+  **instant kill**: it detaches the sink, *discards* a running recording's frames with a loud
+  `ABORTED` line naming the frame count and any orphaned spill file, and releases the cameras —
+  ~0.1 s regardless of how long the recording was. Encoding there would block the rig from coming
+  down for minutes. `finalize_recordings(sessions)` is the **graceful** path: stop + encode every
+  running recording, then wait. It is what the panel's *stop all* and *shut down* controls call
+  (`POST /shutdown`), and the only path that produces files at shutdown. An encode already in
+  flight when Ctrl+C arrives still completes — the thread is non-daemon on purpose, since killing
+  it mid-write would leave a corrupt video.
   Sidecars (best-effort, never raise): `<stem>_timestamps.npy` (sw monotonic, float64),
   `<stem>_hwclock.npz` (hw_count int64, hw_timestamp_ns **float64 with NaN** for missing — the
   Zelux may return None on every frame), `<stem>.json` (metadata.py: sw/hw measured fps, genuine
