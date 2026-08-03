@@ -1,0 +1,66 @@
+/* droplab — shares the xsphere camera dock look (see camera_dock/static/dock.css) */
+body { margin:0; background:#111; color:#ddd; font-family:system-ui,sans-serif; font-size:14px; }
+header { padding:8px 14px; background:#000; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+header b { font-size:16px; }
+#info { color:#7f7; }
+a { color:#8cf; text-decoration:none; }
+a:hover { text-decoration:underline; }
+button { background:#264; color:#dfd; border:1px solid #486; border-radius:4px;
+         padding:6px 10px; cursor:pointer; }
+button:hover { background:#386; }
+button:disabled { opacity:.45; cursor:default; }
+button.run { background:#246; color:#def; border-color:#48a; }
+button.run:hover { background:#368; }
+button.active { background:#2a6a2a; border-color:#5c5; }
+input[type=text], input[type=number], select {
+  background:#222; color:#ddd; border:1px solid #444; border-radius:3px; padding:3px 5px; }
+input[type=range] { width:100%; }
+
+/* index — recordings table */
+.wrap { padding:14px; }
+table.videos { border-collapse:collapse; width:100%; max-width:1100px; }
+table.videos th, table.videos td { border-bottom:1px solid #2c2c2c; padding:6px 10px; text-align:left; }
+table.videos th { color:#889; font-weight:600; }
+table.videos tr:hover td { background:#191919; }
+.badge { display:inline-block; border-radius:3px; padding:1px 7px; font-size:12px; margin-left:6px; }
+.badge.rec { background:#a33; color:#fee; }
+.badge.done { background:#264; color:#cfc; }
+.badge.trk { background:#246; color:#cdf; }
+.badge.job { background:#a75; color:#fed; }
+.small { color:#888; font-size:12px; }
+
+/* lab page */
+.main { display:flex; flex-wrap:wrap; gap:14px; padding:12px; align-items:flex-start; }
+.viewbox { position:relative; width:min(66vw, 1100px); user-select:none; }
+.viewbox img { display:block; width:100%; height:auto; border:1px solid #333;
+               background:#000; min-height:120px; }
+.viewbox canvas { position:absolute; left:0; top:0; pointer-events:none; }
+#dragbox { position:absolute; border:1.5px dashed #4df; background:rgba(80,200,255,.12);
+           pointer-events:none; display:none; }
+.hint { color:#667; font-size:12px; padding-top:4px; }
+.panel { min-width:320px; max-width:400px; background:#1a1a1a; border:1px solid #333;
+         border-radius:6px; padding:12px; flex:1; }
+.panel h3 { margin:4px 0 8px; color:#9ab; font-size:13px; text-transform:uppercase;
+            letter-spacing:.06em; border-bottom:1px solid #2a2a2a; padding-bottom:4px; }
+.row { margin:8px 0; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.row label { color:#aaa; min-width:88px; }
+.row input[type=text] { width:74px; }
+.row .val { color:#7cf; margin-left:auto; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; }
+#count { color:#7f7; font-family:monospace; }
+#stat { color:#fc7; margin-top:8px; min-height:1.2em; word-break:break-all; }
+#toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%);
+         background:#432; color:#fda; border:1px solid #a75; border-radius:6px;
+         padding:8px 14px; display:none; z-index:10; }
+progress { width:100%; height:14px; accent-color:#4a8; }
+.viewmodes button { padding:4px 8px; font-size:12px; }
+.transport button { padding:4px 8px; font-family:monospace; }
+
+/* results */
+.results { padding:0 12px 24px; max-width:1400px; }
+.results h3 { color:#9ab; font-size:13px; text-transform:uppercase; letter-spacing:.06em; }
+.statline { font-family:monospace; color:#cde; margin:2px 0; }
+.gallery { display:flex; flex-wrap:wrap; gap:12px; }
+.gallery a { display:block; border:1px solid #333; border-radius:4px; background:#181818; padding:4px; }
+.gallery img { max-width:330px; max-height:260px; display:block; }
+.gallery .cap { text-align:center; color:#7cf; font-size:12px; padding-top:3px; }

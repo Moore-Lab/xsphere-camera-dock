@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>droplab — recordings</title>
+<link rel="stylesheet" href="static/droplab.css">
+</head>
+<body>
+<header>
+  <b>droplab</b>
+  <span class="small">droplet analysis for camera-dock recordings</span>
+  <span id="info"></span>
+</header>
+<div class="wrap">
+  <table class="videos">
+    <thead>
+      <tr><th>recording</th><th>modified</th><th>size</th><th>frames / fps</th><th>status</th><th></th></tr>
+    </thead>
+    <tbody id="rows"><tr><td colspan="6" class="small">loading…</td></tr></tbody>
+  </table>
+  <p class="hint">List refreshes every 5 s — recordings appear here as soon as the dock finishes
+     encoding them (a <span class="badge rec">writing</span> badge means the file is still growing).</p>
+</div>
+<script>
+// API base = wherever this page is mounted ("" standalone, "/analysis" in the DAQ panel).
+const BASE = location.pathname.replace(/\/+$/, "");
+const fmtSize = b => b > 1e9 ? (b/1e9).toFixed(2)+" GB" : b > 1e6 ? (b/1e6).toFixed(1)+" MB" : Math.round(b/1e3)+" kB";
+const fmtTime = t => new Date(t*1000).toLocaleString();
+
+async function refresh() {
+  let vids = [];
+  try { vids = await (await fetch(BASE + "/videos")).json(); }
+  catch (e) { document.getElementById("info").textContent = "server unreachable"; return; }
+  document.getElementById("info").textContent = vids.length + " recordings";
+  const rows = vids.map(v => {
+    const fps = v.sidecar_fps ? v.sidecar_fps.toFixed(1) + " fps" : "";
+    const frames = v.n_frames_sidecar ? v.n_frames_sidecar + " f" : "";
+    let badges = "";
+    if (v.in_progress) badges += '<span class="badge rec">writing</span>';
+    if (v.active_job) badges += '<span class="badge job">' + v.active_job + '…</span>';
+    if (v.analyzed) badges += '<span class="badge done">analyzed</span>';
+    if (v.tracked) badges += '<span class="badge trk">tracked</span>';
+    return `<tr>
+      <td><a href="${BASE}/lab/${encodeURIComponent(v.name)}">${v.name}</a></td>
+      <td class="small">${fmtTime(v.mtime)}</td>
+      <td class="small">${fmtSize(v.size_bytes)}</td>
+      <td class="small">${frames} ${fps}</td>
+      <td>${badges}</td>
+      <td><a href="${BASE}/lab/${encodeURIComponent(v.name)}"><button>open</button></a></td>
+    </tr>`;
+  });
+  document.getElementById("rows").innerHTML =
+    rows.join("") || '<tr><td colspan="6" class="small">no recordings yet — record something in the camera dock first</td></tr>';
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

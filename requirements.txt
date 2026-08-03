@@ -5,3 +5,6 @@ tzdata                 # IANA tz database for zoneinfo (New Haven timestamps on 
 # Web app / streaming layer (camera_dock.webapp — MJPEG camera stream)
 fastapi
 uvicorn
+# Droplet analysis server (analysis/droplab — count-droplets pipeline)
+scipy                  # distribution fits (Poisson/Rayleigh/half-normal), threshold scan
+matplotlib             # analysis figures (rendered headless via Agg)

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>droplab</title>
+<!-- relative to <base>/lab/<video> so the page works standalone AND mounted -->
+<link rel="stylesheet" href="../static/droplab.css">
+</head>
+<body>
+<header>
+  <a href="../">&larr; recordings</a>
+  <b id="title">…</b>
+  <span id="info" class="small"></span>
+</header>
+
+<div class="main">
+  <div>
+    <div class="viewbox" id="viewbox">
+      <img id="view" alt="frame">
+      <canvas id="tracks-canvas"></canvas>
+      <div id="dragbox"></div>
+    </div>
+    <div class="hint">drag on the image to set the ROI · right-click resets to full frame</div>
+
+    <div class="row transport">
+      <button id="b-back100">&#171;100</button>
+      <button id="b-back10">&#171;10</button>
+      <button id="b-back1">&#8249;1</button>
+      <input type="text" id="frame-num" size="7" value="0">
+      <button id="b-fwd1">1&#8250;</button>
+      <button id="b-fwd10">10&#187;</button>
+      <button id="b-fwd100">100&#187;</button>
+      <span id="count"></span>
+    </div>
+    <input type="range" id="scrub" min="0" max="0" value="0">
+
+    <div class="row viewmodes">
+      view:
+      <button id="vm-raw" class="active">raw</button>
+      <button id="vm-droplets">droplets</button>
+      <button id="vm-processed">processed</button>
+      <button id="vm-sum">sum (window)</button>
+      <button id="vm-sumfull">sum (video)</button>
+      <label style="min-width:0"><input type="checkbox" id="show-tracks"> tracks overlay</label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Detection parameters</h3>
+    <div class="grid2">
+      <div class="row"><label>threshold</label><input type="text" id="p-threshold" value="50"></div>
+      <div class="row"><label>min area</label><input type="text" id="p-min-area" value="10"></div>
+      <div class="row"><label>max area</label><input type="text" id="p-max-area" value="100"></div>
+      <div class="row"><label>start (s)</label><input type="text" id="p-start" value="0"></div>
+      <div class="row"><label>end (s)</label><input type="text" id="p-end" value="0"></div>
+      <div class="row"><label>fps ovr</label><input type="text" id="p-fps" value="" title="blank = container fps"></div>
+      <div class="row"><label>exp (s)</label><input type="text" id="p-exp" value="" title="blank = 1/fps"></div>
+      <div class="row"><label>px/&micro;m</label><input type="text" id="p-ppum" value="0.1878"></div>
+    </div>
+    <div class="small" id="ppum-src"></div>
+    <div class="row"><label>ROI x</label>
+      <input type="text" id="roi-x0"> – <input type="text" id="roi-x1">
+      <button id="roi-full">full</button></div>
+    <div class="row"><label>ROI y</label>
+      <input type="text" id="roi-y0"> – <input type="text" id="roi-y1">
+      <button id="roi-apply">apply</button></div>
+    <div class="row">
+      <select id="log-list" style="flex:1"><option value="">— saved logs —</option></select>
+      <button id="log-load">load log</button>
+    </div>
+    <div class="row">
+      <button id="run-detect" class="run">&#9654; run detection</button>
+      <button id="job-cancel" style="display:none">cancel</button>
+    </div>
+    <progress id="job-prog" max="1" value="0" style="display:none"></progress>
+    <div id="stat"></div>
+
+    <h3>Tracking</h3>
+    <div class="row"><label>max dist (px)</label><input type="text" id="t-dist" value="24">
+      <label style="min-width:0"><input type="checkbox" id="t-auto"> auto</label></div>
+    <div class="row"><label>min length</label><input type="text" id="t-minlen" value="1">
+      <button id="run-track" class="run">&#9654; track</button>
+      <button id="run-trackan" class="run">&#9654; velocity fig</button></div>
+
+    <h3>Distributions</h3>
+    <div class="row"><label>&rho; (kg/m&sup3;)</label><input type="text" id="d-density" value="3520">
+      <button id="run-dist" class="run">&#9654; distributions</button></div>
+
+    <h3>Longitudinal</h3>
+    <div class="row"><label>chunk (s)</label><input type="text" id="l-chunk" value="5">
+      <button id="run-long" class="run">&#9654; longitudinal</button></div>
+  </div>
+</div>
+
+<div class="results">
+  <h3>Results</h3>
+  <div id="res-stats"><span class="small">nothing analyzed yet</span></div>
+  <h3>Plots</h3>
+  <div class="gallery" id="gallery"><span class="small">—</span></div>
+</div>
+
+<div id="toast"></div>
+<script src="../static/lab.js"></script>
+</body>
+</html>

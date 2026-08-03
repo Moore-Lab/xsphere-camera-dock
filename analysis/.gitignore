@@ -1,0 +1,5 @@
+# droplab generated outputs (count-droplets-compatible tree)
+data/
+logs/
+plots/
+__pycache__/
