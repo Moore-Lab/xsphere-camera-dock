@@ -207,11 +207,24 @@ $("sidecar").onchange = e => {
   fr.onload = () => {
     try {
       const j = JSON.parse(fr.result);
-      if (j.um_per_px) {
-        setScale(Number(j.um_per_px), j.calibration || "sidecar");
+      const raw = Number(j.um_per_px);
+      if (isFinite(raw) && raw > 0) {
+        // um_per_px is µm per SENSOR pixel (calibration.py), and it survives
+        // binning by design. This page measures the recorded IMAGE's own pixels
+        // (measure.js defaultTransform), and binning maps bx sensor px onto one
+        // image px — so the scale must be multiplied up. The live page gets this
+        // for free because cam.js's liveTransform already works in sensor px.
+        // ROI is a crop, not a rescale, so it does not enter.
+        // Same conversion as droplab's video.sidecar_pixels_per_um (reciprocal).
+        const b = Array.isArray(j.binning) ? Number(j.binning[0]) : 1;
+        const bx = (isFinite(b) && b > 0) ? b : 1;
+        setScale(raw * bx, j.calibration || "sidecar");
         $("cal-stat").textContent =
-          `from sidecar: ${MeasureLayer.num(j.um_per_px)} µm/px` +
+          `from sidecar: ${MeasureLayer.num(raw * bx)} µm per image px` +
+          (bx !== 1 ? ` (${MeasureLayer.num(raw)} µm/sensor px × ${bx} binning)` : "") +
           (j.calibration ? ` (${j.calibration})` : "");
+      } else if (j.um_per_px) {
+        $("cal-stat").textContent = "that sidecar's um_per_px is not a usable number";
       } else {
         $("cal-stat").textContent = "that sidecar has no um_per_px " +
           "(the camera had no calibration loaded when it recorded)";

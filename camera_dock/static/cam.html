@@ -3,6 +3,14 @@
 <link rel="stylesheet" href="../static/dock.css">
 <link rel="stylesheet" href="../static/measure.css">
 <link rel="icon" type="image/x-icon" href="../static/xsphere.ico">
+<script>
+// Framed by the DAQ panel? Then the panel's rail owns navigation and identity,
+// and this page's "all cameras" link would drive the *pane* into a second,
+// nested camera grid. Hide only those two — the status line and the disconnect
+// button carry live per-camera state the rail does not duplicate. Standalone
+// (window.parent === window) is completely unaffected.
+if (window.parent !== window) document.documentElement.classList.add("embedded");
+</script>
 </head>
 <body>
 <header>

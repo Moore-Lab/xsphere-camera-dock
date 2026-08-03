@@ -2,6 +2,13 @@
 body { margin:0; background:#111; color:#ddd; font-family:system-ui,sans-serif; font-size:14px; }
 header { padding:8px 14px; background:#000; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
 header b { font-size:16px; }
+
+/* Mounted inside the DAQ panel (see the guard in cam.html): the shell's rail
+   owns navigation and names the camera, so drop this page's back-link and
+   title. Everything else stays — the status line and disconnect button are
+   live per-camera state the rail does not duplicate. No effect standalone. */
+.embedded header { padding:5px 14px; background:#0a0a0a; }
+.embedded #rootlink, .embedded header b#title { display:none; }
 #info { color:#7f7; }
 a { color:#8cf; text-decoration:none; }
 a:hover { text-decoration:underline; }
