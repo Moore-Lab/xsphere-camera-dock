@@ -13,6 +13,105 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-08-02 — Three data-loss paths closed (recording finalize, teardown, calibration)
+
+**Context.** A multi-agent review of the DAQ panel + dock + droplab (run from the parent
+repo) surfaced three defects that cost experimental data rather than convenience. All
+three were verified in the source before being fixed, and live-tested after.
+
+- **Limited recordings finalized server-side.** `max_seconds`/`max_frames` made the
+  recorder stop *accepting* frames and raise `limit_reached`; the only caller of stop was
+  the browser poll (`static/cam.js:463`). The DAQ panel mounts camera panes lazily, so a
+  limited recording only finalized while its tab happened to be open — an F5, a tab
+  switch or a closed pop-out stranded the session in `recording` forever, holding RAM and
+  an un-encoded `_xsphere_spill_*.raw` in `%TEMP%`. New `_start_limit_watchdog()` spawns a
+  daemon thread per *limited* recording (unlimited ones start nothing) that polls at 5 Hz
+  and finalizes. The browser call stays as harmless redundancy — it 409s once encoding.
+- **Two shutdown modes** (revised later the same session — see below). Teardown first
+  became encode-on-shutdown, then was reverted to an instant kill at the owner's request,
+  with an explicit graceful path added instead.
+- **Shared finalize path.** All three endings (operator stop, limit, teardown) funnel
+  through `_begin_encode_locked()`. `_recording_extra()` snapshots calibration/ROI/binning
+  on the *calling* thread, because teardown disconnects the camera immediately after —
+  reading them on the encode thread would have silently emptied the sidecar exactly when a
+  recording was being rescued. Its three probes are now independent, so a missing
+  calibration no longer costs the ROI and binning too.
+- **droplab uses the recording's own calibration.** `store.DEFAULT_PIXELS_PER_UM = 0.1878`
+  is a count-droplets constant from a *different* rig, while every dock sidecar carries the
+  real `um_per_px` and `video.py:sidecar_meta()` already loaded and discarded it. New
+  `video.sidecar_pixels_per_um()`: `pixels_per_um = 1 / (um_per_px * binning[0])` —
+  `um_per_px` is per **sensor** pixel, droplab measures **image** pixels, ROI is a crop and
+  does not enter. `probe()` returns it, `video_info()` prefers it, and the lab page shows
+  provenance (green = this recording's calibration, amber = borrowed default). On the sim
+  10x calibration that is 0.7216 vs 0.1878 — a **3.84x** error on every length, and so on
+  volume and mass. Existing `cs165mu_*` recordings have no calibration in their sidecars,
+  so they correctly show amber.
+- **Longitudinal honours the density field.** `lab.js` sent `density_kg_m3` on the
+  distributions job but not the longitudinal one, which the server also reads
+  (`server.py:473`) — so changing the density silently moved one stage and not the other.
+
+**Verified live** (sim camera, panel on :8032): a 3 s limited recording with *no* browser
+attached went recording → `limit_reached` → encoding → idle with 52/52 frames encoded and
+sidecars written; `stop_all()` during an unlimited recording produced a 22 MB video with
+45/45 frames, all three sidecars, and no leftover spill file; the lab page prefills 0.7216
+green for a calibrated recording and 0.1878 amber for an uncalibrated one. Conversion
+helper unit-checked against 14 edge cases (missing/zero/negative/junk `um_per_px`,
+missing/null/empty/zero/junk binning) — all degrade to the honest default.
+
+**Adversarial review of the above** (4 lenses — locking/lifetime, teardown, regressions,
+the physics of the conversion — each finding attacked by 2 independent skeptics). Six
+findings survived; all six were confirmed by hand against the code and fixed:
+
+- **`stop_all` was a regression** and the only finding that cost data in the shipped
+  three-camera config. Teardown now hands recordings to an encode thread and `stop()`
+  joins it, but `stop_all` was still one sequential pass — so camera 1's encode blocked
+  while cameras 2..N kept acquiring, recording and spilling. Split `stop()` into
+  `begin_stop()` + `join_encode()` and made `stop_all` **two passes**: every camera stops
+  acquiring, *then* the files are waited on. Measured with two sim cameras: single-pass
+  gave a **1.878 s** capture-window skew (exactly camera A's 1.885 s encode) and cost the
+  sum of the encodes; two-pass gives **0.003 s** skew and the longest single encode.
+  Before FIX 2 this loop was harmless — `_stop_locked` returned in milliseconds.
+- **`sidecar_pixels_per_um` is the horizontal scale only.** `bx`/`by` are independently
+  settable and every consumer applies the scale isotropically. Rather than returning None
+  on `bx != by` (which would fall back to *another rig's* constant — wrong in both axes
+  instead of one), `probe()` now reports `anisotropic_binning` and the provenance label
+  goes amber and names the problem. Latent today: nothing in any UI posts `/binning`.
+- **`measure.html` had the same class of bug, pre-existing.** It fed the per-**sensor**-px
+  `um_per_px` straight into the offline measure layer, which works in **image** px
+  (`measure.js` `defaultTransform`) — the live page is unaffected because `cam.js`'s
+  transform already works in sensor px. At 2×2 binning, measure and droplab would quote
+  the same calibration name and disagree by exactly `binning[0]`. Now multiplied up, with
+  the working shown in the status line. `measure.js` itself untouched (single-copy rule).
+- **`analyze()` preferred the foreign constant** over the sidecar value already in scope
+  17 lines above — this is the layer that *writes results*, so its default is what lands
+  in the log. Now falls back to the recording's own calibration, plus a positivity check.
+- **The provenance caption was write-once at boot**, so it kept claiming "recording
+  calibration" after anyone typed in the field or loaded a saved log. Now tracks the
+  field: green only while it still equals the sidecar prefill, amber for a hand-entered
+  value, red for a non-number. Verified in the browser across all four states.
+- **`stop()` could skip the join if `_stop_locked` raised** after handing off. Closed
+  structurally by the `try/finally` in the new `stop()` plus the two-pass `stop_all`.
+
+**Resolved — Ctrl+C is an instant kill, graceful shutdown is a button.** The owner's call:
+the rig must always come down promptly, and finishing a recording should be a deliberate
+act, not something shutdown does for you.
+
+- `_stop_locked` discards a running recording again (~0.1 s for two cameras, measured),
+  but no longer *silently*: it prints `ABORTED recording on shutdown — N captured frame(s)
+  discarded, no file written (<name>.avi)` per camera, and names any orphaned
+  `_xsphere_spill_*.raw` left in `%TEMP%` (`stop_and_encode`, which would have removed it,
+  never runs). Silence here is what made this a data-loss bug in the first place.
+- New `webapp.finalize_recordings(sessions)`: stop + encode every running recording, then
+  wait — two passes, so every camera stops capturing before any encode is waited on.
+  This is the only path that writes files at shutdown.
+- `stop_all` stays two-pass for the narrower case of an encode already in flight when
+  shutdown arrives. Such an encode still completes: the thread is non-daemon on purpose,
+  because killing it mid-write leaves a corrupt video.
+
+Measured both modes with two sim cameras recording: instant kill **0.10 s**, no files
+written; graceful **1.97 s** including both encodes (which overlap), two good files,
+capture windows co-terminal to **6 ms**.
+
 ## 2026-08-02 — Rebuild: standardized driver interface + drag-ROI eval server
 
 **Context.** Zelux-first redesign per `docs/DESIGN.md` (spec written and adversarially
