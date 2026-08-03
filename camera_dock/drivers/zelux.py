@@ -4,10 +4,14 @@ Translates the dock's command set (camera_dock.base.CameraDriver) to the Thorlab
 Scientific Camera SDK. Everything here follows docs/DESIGN.md §3; the non-obvious
 choices are all load-bearing:
 
-* One internal RLock serializes EVERY SDK touch — the TSI DLL is not safe for
-  concurrent calls (dualcam_fast needed a global SDK lock for the same reason).
-  The poll path uses a non-blocking poll (image_poll_timeout_ms=0) plus a ~1 ms
-  sleep so the producer thread never starves setter threads waiting on the lock.
+* Two locks, and what matters is what each is held ACROSS. This driver's RLock
+  keeps a *sequence* on one camera atomic (a whole set_roi, a frame copy);
+  drivers/tsi.TSI_LOCK serializes each individual *native call* process-wide,
+  because the TSI DLL is not concurrency-safe and several cameras now share one
+  SDK. Order is always self._lock → tsi.guard(); never the reverse. Holding the
+  global lock across a sequence would stall every other camera — holding it
+  across one call costs microseconds. The poll path uses a non-blocking poll
+  (image_poll_timeout_ms=0) plus a ~1 ms sleep, both outside the global lock.
 * Continuous video is SOFTWARE_TRIGGERED + frames_per_trigger_zero_for_unlimited=0
   (re-set before EVERY arm) + exactly one issue_software_trigger() after arm —
   omit the trigger and polling returns None forever, with no error.
@@ -30,9 +34,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from ..base import CameraDriver, ControlSpec, ControlValue, Frame, FrameMeta
-
-# Default location of the Thorlabs native DLLs on a standard ThorCam install.
-_DEFAULT_DLL_DIR = r"C:\Program Files\Thorlabs\Scientific Imaging\ThorCam"
+from . import tsi
 
 # ROI increment hints. The SDK exposes no increment API; 2 matches observed
 # CS165MU behavior. Hardware read-back is authoritative regardless.
@@ -43,33 +45,23 @@ _ROI_INC = 2
 _EXPOSURE_DUTY_MAX = 0.98
 
 
-def _add_dll_directory() -> None:
-    """Put the Thorlabs native-DLL dir on the search path (before TLCameraSDK()).
-
-    BOTH steps are required: os.add_dll_directory lets ctypes find the main DLL;
-    the PATH prepend lets that DLL's own dependencies resolve.
-    """
-    dll_dir = os.environ.get("THORLABS_TSI_DLL_DIR", _DEFAULT_DLL_DIR)
-    if os.path.isdir(dll_dir):
-        try:
-            os.add_dll_directory(dll_dir)
-        except (OSError, AttributeError):
-            pass
-        os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
-
-
 class ZeluxCamera(CameraDriver):
     """One Thorlabs Zelux CS165MU (USB3, mono, 1440x1080, 10-bit).
 
-    The TSI SDK allows one TLCameraSDK instance per process; this driver owns it
-    between connect() and disconnect(). Don't hold two connected instances.
+    Several of these can run in one process: the TLCameraSDK singleton is owned
+    by drivers/tsi.py and shared, and this class only borrows a handle from it.
+    (It used to build its own SDK per instance, which is why the dock was limited
+    to one Zelux.) Identify a specific unit by serial — with several identical
+    CS165MU attached, an unqualified open is refused rather than guessed.
     """
 
     def __init__(self, serial: Optional[str] = None) -> None:
         super().__init__()
         self.serial = serial
-        self._sdk = None
         self._cam = None
+        self._serial_resolved = None
+        self._info = None                # cached device_info; no DLL per poll
+        self._armed = False              # mirrors arm state; avoids an SDK probe
         self._lock = threading.RLock()   # serializes every SDK call
         self._max_throughput = False
 
@@ -77,9 +69,9 @@ class ZeluxCamera(CameraDriver):
     # lifecycle
     # ------------------------------------------------------------------ #
     def connect(self) -> None:
-        _add_dll_directory()
+        if self._cam is not None:
+            return                       # idempotent: a retry must not re-open
         try:
-            from thorlabs_tsi_sdk.tl_camera import TLCameraSDK
             from thorlabs_tsi_sdk.tl_camera_enums import OPERATION_MODE
         except (ImportError, OSError) as exc:
             raise RuntimeError(
@@ -88,39 +80,32 @@ class ZeluxCamera(CameraDriver):
                 "are discoverable (THORLABS_TSI_DLL_DIR or a ThorCam install). "
                 "Original error: " + str(exc)) from exc
 
-        with self._lock:
-            try:
-                self._sdk = TLCameraSDK()
-            except Exception:
-                # A prior failed dispose leaves the singleton flag set without a
-                # working SDK (0.0.8: dispose() raises WITHOUT clearing the flag).
-                # Force-reset and retry once.
-                if getattr(TLCameraSDK, "_is_sdk_open", False):
-                    TLCameraSDK._is_sdk_open = False
-                    self._sdk = TLCameraSDK()
-                else:
-                    raise
-            try:
-                serials = self._sdk.discover_available_cameras()
-                if not serials:
-                    raise RuntimeError("No Thorlabs cameras found.")
-                target = str(self.serial) if self.serial else serials[0]
-                if target not in serials:
-                    raise RuntimeError(
-                        f"Camera {target} not found. Available: {', '.join(serials)}")
-                self._cam = self._sdk.open_camera(target)
-            except Exception:
-                self._dispose_sdk()
-                raise
-
-            cam = self._cam
-            cam.operation_mode = OPERATION_MODE.SOFTWARE_TRIGGERED
-            cam.frames_per_trigger_zero_for_unlimited = 0
-            # Non-blocking polls: the poll loop sleeps between attempts so the
-            # SDK lock is never held across a blocking wait (DESIGN §3).
-            cam.image_poll_timeout_ms = 0
-
-            self._register_controls()
+        # The SDK is process-wide and owned by drivers/tsi.py — see its module
+        # docstring for why a per-camera TLCameraSDK could never work.
+        cam, resolved = tsi.open_camera(self.serial)
+        try:
+            with self._lock:
+                with tsi.guard():
+                    cam.operation_mode = OPERATION_MODE.SOFTWARE_TRIGGERED
+                with tsi.guard():
+                    cam.frames_per_trigger_zero_for_unlimited = 0
+                with tsi.guard():
+                    # Non-blocking polls: the poll loop sleeps between attempts
+                    # so no lock is ever held across a blocking wait (DESIGN §3).
+                    cam.image_poll_timeout_ms = 0
+                with tsi.guard():
+                    # Cached once: the 2 s /cameras poll from every open browser
+                    # would otherwise hit the DLL for data that never changes.
+                    self._info = {"model": cam.model, "serial": cam.serial_number,
+                                  "vendor": "Thorlabs",
+                                  "sdk": "thorlabs_tsi_sdk 0.0.8"}
+                self._cam = cam
+                self._serial_resolved = resolved
+                self._register_controls()
+        except Exception:
+            tsi.close_camera(cam, resolved)   # never leak the handle
+            self._cam = None
+            raise
 
     def _register_controls(self) -> None:
         """Probe the hardware and register the scalar controls it supports.
@@ -200,42 +185,37 @@ class ZeluxCamera(CameraDriver):
 
     def _set_fps_native(self, v: float) -> None:
         with self._lock:
-            self._cam.frame_rate_control_value = float(v)
+            with tsi.guard():
+                self._cam.frame_rate_control_value = float(v)
 
     def _locked(self, fn):
+        """Every registered control's range/get/set goes through here.
+
+        Both locks: self._lock keeps the read-modify-write coherent for this
+        camera, tsi.guard() keeps the native call exclusive process-wide. These
+        are all single property touches, so the global hold is microseconds.
+        """
         with self._lock:
-            return fn()
+            with tsi.guard():
+                return fn()
 
     def disconnect(self) -> None:
-        with self._lock:
-            try:
-                if self._cam is not None:
-                    try:
-                        if self._cam.is_armed:
-                            self._cam.disarm()
-                    except Exception:
-                        pass
-                    self._cam.dispose()
-            finally:
-                self._cam = None
-                self._dispose_sdk()
-                for name in list(self._controls):
-                    self._unregister(name)
+        """Release this camera. Contractually NEVER raises.
 
-    def _dispose_sdk(self) -> None:
-        if self._sdk is None:
-            return
-        try:
-            self._sdk.dispose()
-        except Exception:
-            # 0.0.8: dispose() raises without clearing the singleton flag — clear
-            # it ourselves so the next connect() can recreate the SDK.
-            try:
-                type(self._sdk)._is_sdk_open = False
-            except Exception:
-                pass
-        finally:
-            self._sdk = None
+        The SDK owner's registry has to stay truthful even when a close fails,
+        or a serial becomes permanently unloadable. tsi.close_camera() owns the
+        quarantine decision; here we only guarantee the driver forgets the
+        handle either way.
+        """
+        with self._lock:
+            cam, self._cam = self._cam, None
+            self._armed = False
+            serial, self._serial_resolved = self._serial_resolved, None
+        if cam is not None:
+            tsi.close_camera(cam, serial)
+        with self._lock:
+            for name in list(self._controls):
+                self._unregister(name)
 
     @property
     def is_connected(self) -> bool:
@@ -251,24 +231,24 @@ class ZeluxCamera(CameraDriver):
     # ------------------------------------------------------------------ #
     @property
     def device_info(self) -> dict:
-        cam = self._require()
-        with self._lock:
-            return {"model": cam.model, "serial": cam.serial_number,
-                    "vendor": "Thorlabs", "sdk": "thorlabs_tsi_sdk 0.0.8"}
+        # Served from the connect-time cache: identity never changes, and every
+        # open browser polls /cameras every 2 s.
+        self._require()
+        return dict(self._info or {})
 
     @property
     def bit_depth(self) -> int:
-        with self._lock:
+        with self._lock, tsi.guard():
             return int(self._require().bit_depth)
 
     def sensor_size(self) -> Tuple[int, int]:
         cam = self._require()
-        with self._lock:
+        with self._lock, tsi.guard():
             return int(cam.sensor_width_pixels), int(cam.sensor_height_pixels)
 
     def image_size(self) -> Tuple[int, int]:
         cam = self._require()
-        with self._lock:
+        with self._lock, tsi.guard():
             return int(cam.image_width_pixels), int(cam.image_height_pixels)
 
     # ------------------------------------------------------------------ #
@@ -276,7 +256,7 @@ class ZeluxCamera(CameraDriver):
     # ------------------------------------------------------------------ #
     def roi_range(self) -> dict:
         cam = self._require()
-        with self._lock:
+        with self._lock, tsi.guard():
             rr = cam.roi_range
             bx, by = int(cam.binx), int(cam.biny)
             # The SDK's ROIRange has no w/h minimums; the image-size ranges do
@@ -330,12 +310,15 @@ class ZeluxCamera(CameraDriver):
         """
         cam = self._require()
         with self._lock:
-            was_armed = bool(cam.is_armed)
+            was_armed = self._armed
             if was_armed:
-                cam.disarm()
+                with tsi.guard():
+                    cam.disarm()
+                self._armed = False
             ulx, uly, lrx, lry = self._clamp_roi(x, y, w, h)
-            roi_type = type(cam.roi)
-            cam.roi = roi_type(ulx, uly, lrx, lry)
+            with tsi.guard():
+                roi_type = type(cam.roi)
+                cam.roi = roi_type(ulx, uly, lrx, lry)
             applied = self.get_roi()
             if was_armed:
                 self._arm_and_trigger()
@@ -344,7 +327,7 @@ class ZeluxCamera(CameraDriver):
 
     def get_roi(self) -> Tuple[int, int, int, int]:
         cam = self._require()
-        with self._lock:
+        with self._lock, tsi.guard():
             r = cam.roi
             return (int(r.upper_left_x_pixels), int(r.upper_left_y_pixels),
                     int(r.lower_right_x_pixels - r.upper_left_x_pixels + 1),
@@ -357,17 +340,20 @@ class ZeluxCamera(CameraDriver):
 
     def binning_range(self) -> Tuple[int, int]:
         cam = self._require()
-        with self._lock:
+        with self._lock, tsi.guard():
             return int(cam.binx_range.max), int(cam.biny_range.max)
 
     def set_binning(self, bx: int, by: int) -> Tuple[int, int]:
         cam = self._require()
         with self._lock:
-            was_armed = bool(cam.is_armed)
+            was_armed = self._armed
             if was_armed:
-                cam.disarm()
-            cam.binx = int(min(max(bx, cam.binx_range.min), cam.binx_range.max))
-            cam.biny = int(min(max(by, cam.biny_range.min), cam.biny_range.max))
+                with tsi.guard():
+                    cam.disarm()
+                self._armed = False
+            with tsi.guard():
+                cam.binx = int(min(max(bx, cam.binx_range.min), cam.binx_range.max))
+                cam.biny = int(min(max(by, cam.biny_range.min), cam.biny_range.max))
             applied = self.get_binning()
             if was_armed:
                 self._arm_and_trigger()
@@ -376,7 +362,7 @@ class ZeluxCamera(CameraDriver):
 
     def get_binning(self) -> Tuple[int, int]:
         cam = self._require()
-        with self._lock:
+        with self._lock, tsi.guard():
             return int(cam.binx), int(cam.biny)
 
     def _reapply_after_rearm(self) -> None:
@@ -428,51 +414,73 @@ class ZeluxCamera(CameraDriver):
     # ------------------------------------------------------------------ #
     def _arm_and_trigger(self) -> None:
         cam = self._cam
-        cam.frames_per_trigger_zero_for_unlimited = 0   # re-set before EVERY arm
-        cam.arm(20 if self._max_throughput else 2)
-        cam.issue_software_trigger()
+        with tsi.guard():
+            cam.frames_per_trigger_zero_for_unlimited = 0  # re-set before EVERY arm
+        with tsi.guard(timeout=5.0):
+            # arm() allocates the frame ring (20 x 3.1 MB at full sensor), so it
+            # is the longest native call here and gets a longer bound.
+            cam.arm(20 if self._max_throughput else 2)
+        with tsi.guard():
+            cam.issue_software_trigger()
+        self._armed = True
 
     def start(self, max_throughput: bool = False) -> None:
-        cam = self._require()
+        self._require()
         with self._lock:
             self._max_throughput = bool(max_throughput)
-            if not cam.is_armed:
+            if not self._armed:
                 self._arm_and_trigger()
                 self._reapply_after_rearm()
 
     def stop(self) -> None:
         cam = self._require()
         with self._lock:
-            if cam.is_armed:
-                cam.disarm()
+            if self._armed:
+                with tsi.guard():
+                    cam.disarm()
+                self._armed = False
 
     @property
     def is_grabbing(self) -> bool:
-        cam = self._cam
-        if cam is None:
-            return False
-        with self._lock:
-            return bool(cam.is_armed)
+        # Mirrored, not probed: this used to be a real tl_camera_get_is_armed
+        # round-trip on every idle poll iteration — ~1 kHz of needless DLL
+        # traffic per camera, which with three cameras contends the global lock
+        # for no information the driver does not already have.
+        return self._cam is not None and self._armed
 
     def grab(self, timeout_ms: int = 5000) -> Frame:
         """Return the next frame from the running stream (poll + copy + meta).
 
-        Non-blocking SDK polls under the lock, ~1 ms sleeps outside it, so
-        control threads interleave freely with acquisition.
+        The global TSI lock is held ONLY across the non-blocking poll — never
+        across the 3.1 MB frame copy, and never across the sleep. The buffer is
+        valid until this camera's next poll or disarm, and both take this
+        camera's own lock, which the copy is still inside. That is what lets
+        three cameras stream without serializing their memcpys.
         """
-        cam = self._require()
+        self._require()
         deadline = perf_counter() + timeout_ms / 1000.0
         while True:
+            data = None
             with self._lock:
-                if self._cam is None:
+                cam = self._cam                 # re-read: disconnect may have nulled it
+                if cam is None:
                     raise RuntimeError("camera disconnected")
-                f = cam.get_pending_frame_or_null()
+                try:
+                    with tsi.guard(timeout=0.25):
+                        f = cam.get_pending_frame_or_null()
+                except tsi.TsiBusy:
+                    # Another camera is mid-ROI-change or mid-arm and holds the
+                    # SDK. That is contention, not a fault: retry until this
+                    # grab's own deadline. Surfacing it as an acquisition error
+                    # would make every other camera look sick for a second every
+                    # time the operator drags an ROI on one of them.
+                    f = None
                 if f is not None:
-                    data = np.copy(f.image_buffer)      # SDK-owned; copy before escape
+                    data = np.copy(f.image_buffer)   # SDK-owned; copy before escape
                     hw_count = int(f.frame_count)
                     ts = f.time_stamp_relative_ns_or_null
                     hw_ts = float(ts) if ts is not None else None
-            if f is not None:
+            if data is not None:
                 return Frame(data=data,
                              meta=FrameMeta(t_sw=perf_counter(),
                                             hw_count=hw_count,

@@ -13,6 +13,57 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-08-03 — Several Zelux in one process: the SDK becomes process-owned
+
+**Context.** The rig has **three** Zelux CS165MU (serials 32943, 29559, 35969) and the
+owner wants them all in one panel. "One Zelux per process" was documented as a hard SDK
+limit; it was not. `ZeluxCamera.connect()` built its own `TLCameraSDK()` — a per-process
+singleton — so a second camera either failed or tripped a recovery path that force-cleared
+`_is_sdk_open` out from under the first. Proved on the rig before writing any code: one
+shared SDK opens and streams all three.
+
+- **New `camera_dock/drivers/tsi.py`** owns the SDK for the process. Three facts drive it,
+  each verified: (1) `open_camera` returns `TLCamera._create(self._sdk, handle)` — the raw
+  cdll, *not* the wrapper — so an open camera holds no reference back, and since
+  `TLCameraSDK.__del__` disposes, letting the SDK become garbage closes it under live
+  cameras. The module global is the only strong reference. (2) `dispose()` closes first and
+  clears `_is_sdk_open` only after the error check, so one bad close wedges the flag
+  permanently — so we never dispose on refcount zero, only at teardown, and *neuter* rather
+  than close if a handle is still open. (3) `discover_available_cameras()` must run before
+  any `open_camera()` or it fails with 1004 "Serial number not found"; it is safe to call
+  while other cameras stream (measured).
+- **Two-tier locking**, and the rule is what each lock is held *across*: the driver's RLock
+  wraps a sequence on one camera (a whole `set_roi`, the 3.1 MB frame copy);
+  `tsi.TSI_LOCK` wraps a single native call, process-wide. Every acquisition is bounded, so
+  a wedged DLL costs one camera and some 503s rather than freezing every handler.
+- **`TsiBusy` in the poll loop is a retry, not an error.** Caught by testing: an ROI change
+  on one camera (~1 s of disarm/set/arm) made the *other two* accrue acquisition errors,
+  which the panel's new liveness indicator would have painted as "no frames". Now zero
+  errors across three ROI changes.
+- **`is_grabbing` is mirrored, not probed** — it used to be a real `tl_camera_get_is_armed`
+  round-trip on every idle poll iteration, ~1 kHz per camera of DLL traffic for information
+  the driver already had. `device_info` is likewise cached at connect (every browser polls
+  `/cameras` every 2 s).
+- **Session-level handle leak fixed.** `start()` wrapped connect + defaults + preset +
+  `engine.start()` in one `except` that set `ok=False` without disconnecting, and
+  `_stop_locked` then early-returned on `not self.ok` — so a failure *after* a successful
+  connect left the camera open forever. Under a shared SDK that makes the serial
+  permanently unloadable. `start()` now disconnects on failure and `_stop_locked` releases
+  whenever the driver is still connected.
+- **`engine.stop()`'s return value is honoured.** It returns False when the producer is
+  wedged inside the SDK; `_stop_locked` discarded it and disconnected anyway — a segfault
+  that, with a shared SDK, would take the other cameras with it. Now it leaves the handle
+  open and says so.
+
+**Measured on the rig, three cameras through the real stack:** 30.0 / 18.0 / 18.0 fps, each
+identical to its solo rate, so the global lock costs nothing; a control write during
+streaming took 17 ms; three ROI changes on one camera produced zero errors on the others;
+`/cameras` reports 3/3, all three panes stream 1440×1080, and teardown releases the SDK
+cleanly. (The 18 fps pair is state persisted on those cameras, not a dock behaviour.)
+
+**Still to come:** runtime discovery/add/remove (no more fixed token list), serial-keyed
+persistence with editable labels, and the UI for both.
+
 ## 2026-08-02 — Three data-loss paths closed (recording finalize, teardown, calibration)
 
 **Context.** A multi-agent review of the DAQ panel + dock + droplab (run from the parent

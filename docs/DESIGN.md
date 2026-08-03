@@ -234,6 +234,21 @@ New/changed:
   the session lock. `record_start` (409 unless idle): makedirs + `%f`-timestamped path first,
   create recorder, assign state, `set_sink` **last** (cleanup on any failure). `record_stop`
   (409 unless recording): `set_sink(None)` (barrier), state=encoding, spawn **non-daemon** encode
+- **Thorlabs SDK ownership (§3a).** The TSI SDK is a per-process singleton, so `drivers/tsi.py`
+  owns exactly one `TLCameraSDK` for the process and every Zelux borrows a handle from it.
+  `ZeluxCamera` used to build its own, which is the only reason the dock was ever limited to one
+  Zelux — **that limit is gone; three CS165MU run in one panel, measured**. Load-bearing details:
+  the module global is the *only* strong reference (an open `TLCamera` gets the raw cdll, not the
+  wrapper, so letting the SDK become garbage closes it under live cameras);
+  `discover_available_cameras()` must run before any `open_camera()` or it fails with 1004;
+  the SDK is **never** disposed on refcount zero, only once at teardown after `stop_all`, and it
+  *neuters* instead of closing if any handle is still open. Locking is two-tier and the rule is
+  what each is held **across**: the driver's own RLock wraps a *sequence* on one camera (a whole
+  `set_roi`, the 3.1 MB frame copy); `tsi.TSI_LOCK` wraps a single *native call* process-wide.
+  Order is always `camera._lock -> tsi.guard()`. Every acquisition is bounded, so a wedged DLL
+  costs one camera and a stream of 503s instead of freezing every request handler. `TsiBusy` in
+  the poll loop is a retry, not an acquisition error — otherwise one operator dragging an ROI
+  makes every other camera read as faulty.
   thread; encode runs without the lock (never touches the camera); on completion stores stats,
   state=idle. `/record/status` polls state+stats. Disconnect/shutdown joins the encode thread.
   Both ways a recording is *finished* (operator stop, limit reached) funnel through

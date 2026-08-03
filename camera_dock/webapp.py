@@ -225,6 +225,15 @@ class CameraSession:
                 self.ok = True
                 self.error = ""
             except Exception as exc:      # one bad camera never sinks the app
+                # Release the handle if connect() succeeded and something after
+                # it failed (defaults, preset, engine.start, cache refresh).
+                # Without this the driver holds the camera open while ok=False,
+                # and _stop_locked's early return means nothing ever closes it —
+                # with a shared SDK that makes the serial permanently unloadable.
+                try:
+                    self.camera.disconnect()
+                except Exception:
+                    pass
                 self.ok, self.error = False, str(exc)
 
     def _apply_defaults(self) -> None:
@@ -275,7 +284,10 @@ class CameraSession:
             t.join(timeout=timeout)       # finalize the file (non-daemon backstop)
 
     def _stop_locked(self) -> None:
-        if not self.ok:
+        # Not `if not self.ok` — a session whose start() failed after connect()
+        # succeeded is ok=False while the driver still holds the camera open.
+        # Under a shared SDK that leaks the serial for the life of the process.
+        if not self.ok and not getattr(self.camera, "is_connected", False):
             return
         try:
             tl = self.timelapse
@@ -304,8 +316,17 @@ class CameraSession:
                     # have removed it) never ran. Name it rather than leaving a
                     # multi-GB orphan nobody knows about.
                     print(f"[{self.name}] raw spill left at {spill}", flush=True)
-            self.engine.stop()
-            self.camera.disconnect()
+            # engine.stop() returns False when the producer is still inside an
+            # SDK call. Closing the camera under it is a segfault, and with a
+            # shared SDK it would take the other cameras with it. Leave the
+            # handle open and say so — a leaked camera beats a crashed rig.
+            joined = self.engine.stop()
+            if joined is False:
+                self.error = ("acquisition thread is wedged inside the SDK; the "
+                              "camera was left open — restart the DAQ to release it")
+                print(f"[{self.name}] {self.error}", flush=True)
+            else:
+                self.camera.disconnect()
         finally:
             self.ok = False
 
@@ -642,6 +663,15 @@ class CameraSession:
 
 def start_all(sessions: dict) -> None:
     """Connect + start every session. NEVER raises (per-session isolation)."""
+    # Seed the Thorlabs handle table before anything opens: open_camera() fails
+    # with "Serial number not found" unless discover_available_cameras() has run
+    # on the shared SDK. Doing it here, with nothing open, is the only condition
+    # we have evidence for. No-ops when no Thorlabs camera is configured.
+    try:
+        from .drivers import tsi
+        tsi.discover(force=True)
+    except Exception:
+        pass
     for s in sessions.values():
         try:
             s.start()
@@ -699,6 +729,13 @@ def stop_all(sessions: dict) -> None:
         except Exception as exc:
             s.error = str(exc)
             print(f"[{s.name}] error finalizing recording: {exc}", flush=True)
+    # Last: release the process-wide Thorlabs SDK, once every camera is closed.
+    # Never before — closing it under a live handle is a segfault.
+    try:
+        from .drivers import tsi
+        tsi.shutdown()
+    except Exception:
+        pass
 
 
 def create_app(sessions: dict, *, manage_lifecycle: bool = True):

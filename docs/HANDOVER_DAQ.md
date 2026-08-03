@@ -79,10 +79,14 @@ have you work around it.
 
 ## Constraints worth knowing
 
-- **One Zelux per process.** The Thorlabs TSI SDK is a hard per-process singleton. A panel
-  process can drive at most one `zelux` token. Two Zelux cameras ⇒ two processes on two
-  ports (or a shared-SDK restructure — `reference/dualcam_fast.py` shows the pattern).
-  `sim` has no such limit, hence `sim sim:2` for multi-camera panel work.
+- ~~**One Zelux per process.**~~ **No longer true (2026-08-03).** The `TLCameraSDK` singleton is
+  per-process, but it was only ever a limit because `ZeluxCamera` built its own instance per
+  camera. `drivers/tsi.py` now owns one SDK for the process and every Zelux borrows a handle.
+  **Three CS165MU run in one panel** — measured on the rig at 30/18/18 fps, each unaffected by
+  the others, with control writes and ROI changes on one costing the others nothing. Address a
+  specific unit by serial (`zelux:32943`); with several identical cameras attached an
+  unqualified `zelux` token is refused rather than silently binding an arbitrary one.
+  See DESIGN.md §3a for the SDK-ownership and two-tier locking rules.
 - **Data directories are anchored to the dock repo root**, never the CWD
   (`camera_dock/paths.py`): `recordings/`, `captures/`, `presets/`, `calibrations/`. This
   is deliberate — the panel launches with a different CWD and used to split the data.
