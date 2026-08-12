@@ -22,7 +22,9 @@ Per-camera endpoints (prefix ``/cam/{name}``):
     POST /auto_exposure
     POST /roi?x=&y=&w=&h=  ·  POST /roi/reset  ·  POST /binning?bx=&by=
     POST /record/start?max_seconds=&max_frames=  ·  /record/stop  ·  GET /record/status
-    POST /timelapse/start?interval=&hours=&dir=&fmt=  ·  /timelapse/stop  ·  GET /timelapse/status
+    POST /timelapse/start?interval=&hours=&dir=&fmt=&scale=raw|view|align
+                         &resolution=full|half|quarter
+                       ·  /timelapse/stop  ·  GET /timelapse/status
     GET  /presets  ·  POST /presets/save?preset=  ·  POST /presets/load?preset=
     GET  /calibration  ·  POST /calibration/save?name=&um_per_px=&label=&notes=
                        ·  POST /calibration/load?name=  ·  /calibration/clear
@@ -73,6 +75,51 @@ def _to_8bit(bit_depth: int):
     return lambda f: (f >> shift).astype(np.uint8)
 
 
+# How a saved still is scaled. A sensor shallower than its container (the Zelux
+# is 10-bit delivered in uint16) writes values in the bottom 1/64 of the file's
+# range, so every viewer renders it far darker than the live stream — same
+# photons, same exposure and gain, different scaling.
+SNAPSHOT_SCALES = ("raw", "view", "align")
+
+# Saved-still resolution. A monitoring timelapse does not need sensor
+# resolution, and the file size is what decides whether a week-long run fits:
+# halving each side is a quarter of the data, quartering it a sixteenth.
+RESOLUTIONS = {"full": 1, "half": 2, "quarter": 4}
+
+
+def _resize_frame(data: np.ndarray, resolution: str) -> np.ndarray:
+    """Downscale a native frame by an integer factor (INTER_AREA = pixel
+    averaging, the correct filter for shrinking — plain sampling would alias
+    small features away). Applied BEFORE any bit-depth scaling so the average
+    is taken at full precision."""
+    n = RESOLUTIONS.get(resolution, 1)
+    if n <= 1:
+        return data
+    h, w = data.shape[:2]
+    return cv2.resize(data, (max(1, w // n), max(1, h // n)),
+                      interpolation=cv2.INTER_AREA)
+
+
+def _scale_frame(data: np.ndarray, scale: str, to8, bit_depth: int) -> np.ndarray:
+    """Apply a save-time scaling to a native frame.
+
+    ``raw``   the sensor's own values, untouched (the historical behaviour, and
+              what anything already parsing these files expects)
+    ``view``  exactly what the live stream shows — 8-bit via the session's own
+              ``to8``, so the saved still cannot drift from the preview
+    ``align`` full precision, brightness corrected: the same bits shifted up to
+              fill the container (a 10-bit frame becomes 16-bit MSB-aligned).
+              Lossless and exactly reversible (>> the same shift).
+    """
+    if scale == "view":
+        return to8(data)
+    if scale == "align" and data.dtype == np.uint16:
+        shift = max(16 - int(bit_depth), 0)
+        if shift:
+            return (data << shift).astype(np.uint16)
+    return data
+
+
 def _slug(info: dict) -> str:
     return str(info.get("model", "camera")).replace(" ", "").replace("/", "-").lower()
 
@@ -92,12 +139,16 @@ class Timelapse:
     """
 
     def __init__(self, session: "CameraSession", interval_s: float,
-                 duration_s: float, directory: str, fmt: str) -> None:
+                 duration_s: float, directory: str, fmt: str,
+                 scale: str = "raw", resolution: str = "full") -> None:
         self.session = session
         self.interval_s = float(interval_s)
         self.duration_s = float(duration_s)          # 0 = run until stopped
         self.directory = directory
         self.fmt = fmt
+        self.scale = scale                           # see _scale_frame
+        self.resolution = resolution                 # see _resize_frame
+        self.saved_size = None                       # (w, h) actually written
         self.taken = 0
         self.missed = 0
         self.stale = 0
@@ -130,8 +181,14 @@ class Timelapse:
             else:
                 base = datetime.now().strftime(f"{self._slug}_%Y%m%d_%H%M%S_%f")
                 try:
+                    # Read to8/bit_depth per shot, not at construction: they are
+                    # re-derived on every connect, and a timelapse outlives one.
+                    data = _resize_frame(frame.data, self.resolution)
+                    data = _scale_frame(data, self.scale,
+                                        self.session.to8, self.session.bit_depth)
+                    self.saved_size = (int(data.shape[1]), int(data.shape[0]))
                     self.last_path = imaging.save_snapshot(
-                        frame.data, os.path.join(self.directory, base), self.fmt)
+                        data, os.path.join(self.directory, base), self.fmt)
                     self.taken += 1
                     self._last_index = index
                     self.error = ""
@@ -159,7 +216,10 @@ class Timelapse:
                 "remaining_s": round(remaining, 1) if remaining is not None else None,
                 "next_in_s": round(next_in, 1) if next_in is not None else None,
                 "taken": self.taken, "missed": self.missed, "stale": self.stale,
-                "dir": self.directory, "fmt": self.fmt, "last_path": self.last_path,
+                "dir": self.directory, "fmt": self.fmt, "scale": self.scale,
+                "resolution": self.resolution,
+                "saved_size": list(self.saved_size) if self.saved_size else None,
+                "last_path": self.last_path,
                 "error": self.error,
                 "started": self.started_wall.strftime("%Y-%m-%d %H:%M:%S")}
 
@@ -594,7 +654,8 @@ class CameraSession:
 
     # --- timelapse -----------------------------------------------------------
     def timelapse_start(self, interval_s: float, hours: float,
-                        directory: str, fmt: str) -> dict:
+                        directory: str, fmt: str, scale: str = "raw",
+                        resolution: str = "full") -> dict:
         with self.lock:
             if not self.ok:
                 raise _Conflict("camera not connected")
@@ -611,6 +672,12 @@ class CameraSession:
             fmt = (fmt or "tiff").lower()
             if fmt not in imaging.SNAPSHOT_FORMATS:
                 raise ValueError(f"format must be one of {', '.join(imaging.SNAPSHOT_FORMATS)}")
+            scale = (scale or "raw").lower()
+            if scale not in SNAPSHOT_SCALES:
+                raise ValueError(f"scale must be one of {', '.join(SNAPSHOT_SCALES)}")
+            resolution = (resolution or "full").lower()
+            if resolution not in RESOLUTIONS:
+                raise ValueError(f"resolution must be one of {', '.join(RESOLUTIONS)}")
             directory = (directory or "").strip() or datetime.now().strftime(
                 f"captures/timelapse_{_slug(self.camera.device_info)}_%Y%m%d_%H%M%S")
             directory = resolve(directory)
@@ -618,7 +685,8 @@ class CameraSession:
                 os.makedirs(directory, exist_ok=True)
             except OSError as exc:
                 raise ValueError(f"cannot create save directory: {exc}")
-            self.timelapse = Timelapse(self, interval_s, hours * 3600.0, directory, fmt)
+            self.timelapse = Timelapse(self, interval_s, hours * 3600.0, directory,
+                                       fmt, scale, resolution)
             return self.timelapse.status()
 
     def timelapse_stop(self) -> dict:
@@ -931,10 +999,11 @@ def create_app(sessions: dict, *, manage_lifecycle: bool = True):
     # --- timelapse ---
     @app.post("/cam/{name}/timelapse/start")
     def timelapse_start(name: str, interval: float = 30.0, hours: float = 0.0,
-                        dir: str = "", fmt: str = "tiff"):
+                        dir: str = "", fmt: str = "tiff", scale: str = "raw",
+                        resolution: str = "full"):
         s = sess(name)
         try:
-            return s.timelapse_start(interval, hours, dir, fmt)
+            return s.timelapse_start(interval, hours, dir, fmt, scale, resolution)
         except ValueError as exc:
             raise HTTPException(422, str(exc))
         except _Conflict as exc:
