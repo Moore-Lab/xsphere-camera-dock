@@ -21,6 +21,7 @@ Per-camera endpoints (prefix ``/cam/{name}``):
     POST /control/{ctl}?value=&normalized=     the generic funnel
     POST /auto_exposure
     POST /roi?x=&y=&w=&h=  ·  POST /roi/reset  ·  POST /binning?bx=&by=
+    GET  /orientation  ·  POST /orientation?op=cw|ccw|flip_h|flip_v|reset  (or rotate=&mirror=)
     POST /record/start?max_seconds=&max_frames=  ·  /record/stop  ·  GET /record/status
     POST /timelapse/start?interval=&hours=&dir=&fmt=&scale=raw|view|align
                          &resolution=full|half|quarter
@@ -56,10 +57,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
-from . import calibration, imaging, presets
+from . import calibration, imaging, orientation, presets
 from .base import Frame
 from .drivers import make_camera
 from .engine import AcquisitionEngine
+from .orientation import Orientation
 from .paths import data_dir, resolve
 from .recorder import HybridRecorder
 
@@ -235,7 +237,9 @@ class CameraSession:
     def __init__(self, name: str, camera) -> None:
         self.name = name
         self.camera = camera
-        self.engine = AcquisitionEngine(camera)
+        # Orientation is how the camera is MOUNTED, so it is loaded here — before
+        # any connect — and survives restarts (orientation.py).
+        self.engine = AcquisitionEngine(camera, orientation.load(name))
         self.to8 = _to_8bit(8)
         self.bit_depth = 8
         self.has_roi = False
@@ -313,7 +317,10 @@ class CameraSession:
 
     def _refresh_caches(self) -> None:
         try:
-            w, h = self.camera.image_size()
+            # The engine hands out ORIENTED frames, so a quarter turn swaps the
+            # shape. Comparing against the native size would reject every frame
+            # as stale geometry and black out the stream.
+            w, h = self.engine.orientation.size(*self.camera.image_size())
             self.expected_shape = (h, w)
         except Exception:
             self.expected_shape = None
@@ -448,11 +455,14 @@ class CameraSession:
              "rec_state": self.rec_state,
              "timelapse_running": self.timelapse.running if self.timelapse else False,
              "acquisition_fps": round(self.engine.acquisition_fps, 1),
-             "acquisition_errors": self.engine.error_count}
+             "acquisition_errors": self.engine.error_count,
+             "orientation": self.engine.orientation.as_dict()}
         if self.ok:
             try:
                 di = self.camera.device_info
-                w, h = self.camera.image_size()
+                # width/height describe the frames as DELIVERED — oriented, i.e.
+                # what the stream shows and a recording contains.
+                w, h = self.engine.orientation.size(*self.camera.image_size())
                 d.update({"model": di.get("model"), "serial": di.get("serial"),
                           "width": w, "height": h})
                 if self.has_roi:
@@ -467,10 +477,15 @@ class CameraSession:
     def capabilities(self) -> dict:
         caps = {"controls": self.camera.capabilities(),
                 "bit_depth": self.bit_depth,
-                "has_roi": self.has_roi}
+                "has_roi": self.has_roi,
+                "orientation": self.engine.orientation.as_dict()}
         try:
             caps["sensor_size"] = list(self.camera.sensor_size())
-            caps["image_size"] = list(self.camera.image_size())
+            # image_size stays NATIVE — the ROI/binning grid that sensor maths
+            # needs. display_size is the oriented frame the stream actually sends.
+            iw, ih = self.camera.image_size()
+            caps["image_size"] = [iw, ih]
+            caps["display_size"] = list(self.engine.orientation.size(iw, ih))
         except Exception:
             pass
         if self.has_roi:
@@ -509,7 +524,40 @@ class CameraSession:
             out = {"capabilities": self.capabilities()}
             out["roi"] = out["capabilities"].get("roi")
             out["image_size"] = out["capabilities"].get("image_size")
+            out["display_size"] = out["capabilities"].get("display_size")
             return out
+
+    # --- orientation (software rotate / mirror of every frame) ---------------
+    def change_orientation(self, *, op: Optional[str] = None,
+                           rotate: Optional[int] = None,
+                           mirror: Optional[bool] = None) -> dict:
+        """Re-orient the camera: a display-space ``op`` (cw, ccw, flip_h, flip_v,
+        reset) or an absolute ``rotate``/``mirror``. Saved per camera.
+
+        Refused while recording or timelapsing, exactly like a region change:
+        the recorder latches the frame shape, and one folder of stills must not
+        mix orientations. Allowed while disconnected — it is mounting config,
+        not camera state.
+        """
+        with self.lock:
+            if self.rec_state != "idle":
+                raise _Conflict("stop recording before changing the orientation")
+            if self.timelapse is not None and self.timelapse.running:
+                raise _Conflict("stop the timelapse before changing the orientation")
+            cur = self.engine.orientation
+            if op is not None:
+                new = cur.compose(op)                 # ValueError -> 422
+            else:
+                new = Orientation(cur.rotate if rotate is None else rotate,
+                                  cur.mirror if mirror is None else mirror)
+            orientation.save(self.name, new)          # persist first: a failed
+            self.engine.set_orientation(new)          # save changes nothing
+            if self.ok:
+                self._refresh_caches()
+        out = {"orientation": new.as_dict()}
+        if self.ok:
+            out["capabilities"] = self.capabilities()
+        return out
 
     # --- recording -----------------------------------------------------------
     def record_start(self, max_seconds: float = 0.0, max_frames: int = 0) -> dict:
@@ -568,6 +616,9 @@ class CameraSession:
             extra["binning"] = list(self.camera.get_binning())
         except Exception:
             pass
+        # The frames in the file are oriented; roi and binning above are SENSOR
+        # coordinates. This is the key that maps one onto the other.
+        extra["orientation"] = self.engine.orientation.as_dict()
         return extra
 
     def _begin_encode_locked(self) -> str:
@@ -976,6 +1027,27 @@ def create_app(sessions: dict, *, manage_lifecycle: bool = True):
     def set_binning(name: str, bx: int, by: int):
         s = sess(name)
         return _region(s, lambda: s.camera.set_binning(bx, by))
+
+    # --- orientation ---
+    @app.get("/cam/{name}/orientation")
+    def get_orientation(name: str):
+        return sess(name, need_ok=False).engine.orientation.as_dict()
+
+    @app.post("/cam/{name}/orientation")
+    def set_orientation(name: str, op: Optional[str] = None,
+                        rotate: Optional[int] = None, mirror: Optional[bool] = None):
+        s = sess(name, need_ok=False)
+        if op is None and rotate is None and mirror is None:
+            raise HTTPException(422, "give op=cw|ccw|flip_h|flip_v|reset, "
+                                     "or rotate= and/or mirror=")
+        try:
+            return s.change_orientation(op=op, rotate=rotate, mirror=mirror)
+        except _Conflict as exc:
+            raise HTTPException(409, str(exc))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        except OSError as exc:
+            raise HTTPException(500, f"could not save the orientation: {exc}")
 
     # --- recording ---
     @app.post("/cam/{name}/record/start")

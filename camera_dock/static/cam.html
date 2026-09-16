@@ -43,6 +43,15 @@ if (window.parent !== window) document.documentElement.classList.add("embedded")
       <input id="roi-w" type="text"> <input id="roi-h" type="text">
       <button id="roi-apply">apply</button> <button id="roi-full">full frame</button>
     </div>
+    <div class="row" id="orient-row">
+      <label>orientation <span class="val" id="orient-label"></span></label>
+      <button id="orient-ccw" title="rotate 90° counter-clockwise">&#10226; 90&deg;</button>
+      <button id="orient-cw" title="rotate 90° clockwise">&#10227; 90&deg;</button>
+      <button id="orient-fh" title="flip left–right">&#8596; flip</button>
+      <button id="orient-fv" title="flip top–bottom">&#8597; flip</button>
+      <button id="orient-reset" title="back to the sensor's own orientation">reset</button>
+      <div class="small">applies to the stream, recordings, timelapse stills and snapshots</div>
+    </div>
 
     <div class="row" id="measure-row">
       <label>measurements <span class="val" id="measure-count"></span></label>

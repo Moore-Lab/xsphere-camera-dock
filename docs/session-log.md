@@ -13,6 +13,66 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-09-15 — Camera orientation: rotate 90° at a time, mirror, applied to saved data
+
+**Context.** Cameras get mounted sideways or look through a mirror; the owner wants the picture
+upright, and wants recordings, stills and snapshots to come out the way the stream looks. The
+TSI SDK offers no readout flip or rotation (none of `TLCamera`'s 106 attributes), so it is
+software.
+
+- **One choke point.** `AcquisitionEngine._loop` orients each frame right after `grab()`, so
+  the latest slot and the recorder sink both receive oriented frames. Measured 0.6–0.9 ms per
+  full 1440×1080 frame (~2–3 % of a core at 35 fps); upright returns the same array at zero
+  cost. A generation counter drops a frame transformed under the previous orientation, and
+  `set_orientation` clears the latest slot.
+- **New `camera_dock/orientation.py`:** `(rotate cw, mirror)` with mirror applied first — 8
+  states, one representation each. Buttons compose in display space (`cw`, `ccw`, `flip_h`,
+  `flip_v`, `reset`). Saved per camera in `orientations/<camera>.json` (gitignored) because it
+  describes the MOUNTING and must survive a restart.
+- **The trap.** `fresh_frame` drops any frame whose shape differs from `expected_shape`, which
+  came from the native `image_size()`. A quarter turn swaps the shape, so without updating it
+  every frame reads as stale geometry and the stream goes black. `expected_shape` and `/info`
+  width/height are now oriented; `capabilities.image_size` stays native (the ROI/binning grid)
+  with a new `display_size` beside it.
+- **The sensor does not rotate.** ROI, binning, presets and annotations stay in sensor pixels.
+  cam.js had two separate display→sensor bridges — the measure layer's
+  `sensorToDisplay`/`displayToSensor` and the ROI drag's own inline corner maths — and both now
+  go through `orientFwd`/`orientInv`. The staleness gate compares against `display_size`.
+  measure.js gained an optional `transform.swapsAxes()` so a rectangle's "w × h" reads as seen
+  (NOTE[live->offline]; the offline host is untouched).
+- Refused (409) while recording, encoding or timelapsing, like a region change. Video sidecars
+  record `orientation` next to `roi`/`binning`.
+
+**Verified.** `tests/test_orientation.py` (76 tests): all 8 orientations against numpy, all 32
+state × button compositions, the cam.js maps mirrored in Python and pinned against real frames
+for every pixel, dragged boxes crop exactly the covered pixels, and end-to-end with the sim
+camera (fresh frames, `/info`, capabilities, sidecar extra, 409 while recording, persistence
+across a new session, the HTTP route). Parent panel tests still pass. On the running panel after
+a real ⟳ click: stream, `/info`, a server snapshot, a saved snapshot TIFF, a timelapse still and
+a recording's video frames were all 1080×1440, with the sidecar carrying `orientation` beside
+the unrotated sensor ROI. A drag over the displayed top-left posted `x=0 y=540 w=360 h=540` —
+the sensor's bottom-left, as a clockwise turn predicts.
+
+**Adversarial review** (10 agents; 4 of 8 findings confirmed, all fixed):
+- *Stale frame into a new recording.* The generation check guarded the latest slot but not
+  the sink, so a record_start landing right after a re-orientation could hand the recorder one
+  old-shape frame; the recorder latches that shape and silently drops the rest of the take.
+  The sink now re-checks the generation. A deterministic test reproduces the window and fails
+  against the pre-fix loop (first delivered shape `(3, 5)`, then `(5, 3)`).
+- *Re-orienting while disconnected* returned no capabilities, so the page kept the old
+  `display_size`; after another client reconnected, ROI drags were refused forever and
+  measurements were scaled 25–33 % wrong. The page now drops its size on that path, and
+  `pollInfo` refetches capabilities whenever `/info`'s delivered width/height differ from what it
+  holds (which also reconciles a binning change made in another tab).
+- *Scale readers used the sensor's bx after a quarter turn.* droplab's
+  `sidecar_pixels_per_um` and measure.html's sidecar loader now take the binning of the
+  recording's own horizontal axis (`sidecar_image_binning`); droplab's anisotropy caption names
+  image axes. Only matters with bx ≠ by, which the Zelux driver allows.
+- *The measurement table* kept the pre-turn "w × h" while the overlay swapped; it is rebuilt
+  when the quarter-turn state changes.
+
+---
+
 ## 2026-08-03 — Several Zelux in one process: the SDK becomes process-owned
 
 **Context.** The rig has **three** Zelux CS165MU (serials 32943, 29559, 35969) and the

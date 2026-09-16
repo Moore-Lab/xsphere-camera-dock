@@ -90,11 +90,13 @@ def _ppum_provenance(info: dict) -> dict:
     named = f'recording calibration “{info["calibration"]}”' if info.get("calibration") \
         else "recording calibration"
     if info.get("anisotropic_binning"):
-        b = info.get("binning") or []
+        # Name the IMAGE's axes: after a quarter turn the recording's horizontal
+        # axis is sensor y, and the scale follows it (video.sidecar_image_binning).
+        b = info.get("image_binning") or info.get("binning") or []
         bxby = f"{b[0]}×{b[1]}" if len(b) > 1 else "anisotropic"
         return {"pixels_per_um_source":
-                    f"{named} — binning is {bxby}, so this scale is valid for the "
-                    f"horizontal axis only",
+                    f"{named} — image binning is {bxby} (horizontal×vertical), so "
+                    f"this scale is valid for the horizontal axis only",
                 "pixels_per_um_from_sidecar": False}
     return {"pixels_per_um_source": named, "pixels_per_um_from_sidecar": True}
 

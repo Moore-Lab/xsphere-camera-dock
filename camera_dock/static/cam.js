@@ -8,7 +8,10 @@
  *  - the echoed APPLIED ROI is adopted (hardware snaps requests);
  *  - the zoom stack pushes the PREVIOUS applied ROI only after a 2xx;
  *  - after every successful ROI change the stream <img> reconnects with a fresh
- *    epoch (an <img> never auto-reconnects a stalled MJPEG response).
+ *    epoch (an <img> never auto-reconnects a stalled MJPEG response);
+ *  - frames arrive ORIENTED (rotate/mirror, camera_dock/orientation.py) while
+ *    the ROI, binning and every annotation stay in SENSOR pixels, so each
+ *    display<->sensor map passes through orientFwd/orientInv below.
  * Everything is in CSS pixels — devicePixelRatio is irrelevant by design.
  */
 "use strict";
@@ -25,7 +28,9 @@ $("title").textContent = NAME;
 // ------------------------------------------------------------------ state --
 let R = {                   // mirror of last server echo
   roi: null,                // [x, y, w, h] sensor coords
-  imageSize: null,          // [Iw, Ih]
+  imageSize: null,          // [Iw, Ih] NATIVE image — the ROI/binning grid
+  displaySize: null,        // [Dw, Dh] the oriented frame the stream shows
+  orient: { rotate: 0, mirror: false },
   sensor: null,             // [Sw, Sh]
   binning: [1, 1],
   hasRoi: false,
@@ -153,6 +158,11 @@ function adoptCaps(c) {
   if (M) M.epoch = capsRev;   // discards any drag started under the old geometry
   R.hasRoi = !!c.has_roi;
   R.imageSize = c.image_size || null;
+  // A server without orientation support sends neither field: upright, same size.
+  R.displaySize = c.display_size || c.image_size || null;
+  const quarterBefore = !!R.orient && R.orient.rotate % 180 === 90;
+  R.orient = c.orientation || { rotate: 0, mirror: false };
+  paintOrientation();
   R.sensor = c.sensor_size || null;
   R.binning = c.binning || [1, 1];
   if (c.roi) R.roi = c.roi;
@@ -160,6 +170,9 @@ function adoptCaps(c) {
   drawRoiFields();
   $("roi-row").style.display = R.hasRoi ? "" : "none";
   redraw();                  // annotations follow the new geometry
+  // A quarter turn swaps a rectangle's "w × h" (transform.swapsAxes). redraw()
+  // relabels the overlay, but the table is only rebuilt by renderMeasures.
+  if (M && quarterBefore !== (R.orient.rotate % 180 === 90)) renderMeasures();
 }
 
 async function loadCaps() {
@@ -174,23 +187,48 @@ function drawRoiFields() {
   if (!R.roi) return;
   $("roi-x").value = R.roi[0]; $("roi-y").value = R.roi[1];
   $("roi-w").value = R.roi[2]; $("roi-h").value = R.roi[3];
-  $("roi-eff").textContent = R.imageSize ? `image ${R.imageSize[0]}×${R.imageSize[1]}` : "";
+  $("roi-eff").textContent = R.displaySize ? `image ${R.displaySize[0]}×${R.displaySize[1]}` : "";
 }
 
 // ------------------------------------------------------- coordinate maps ---
-// The <img> shows the current ROI at some displayed size. Annotations are kept
-// in sensor pixels, so both directions go through the ROI origin and binning.
+// The <img> shows the current ROI, ORIENTED, at some displayed size. The ROI,
+// binning and annotations are all in sensor pixels, so a point travels
+//   display px -> oriented image px -> native image px -> sensor px
+// and back. The middle step is the orientation (camera_dock/orientation.py:
+// mirror left-right FIRST, then rotate clockwise). Continuous coordinates
+// throughout, so pixel EDGES land on pixel edges and a box maps to a box.
+// tests/test_orientation.py mirrors these two functions verbatim and pins them
+// against the server's numpy transform — change both together.
+function orientFwd(x, y, o, W, H) {       // native image -> oriented; W,H native
+  if (o.mirror) x = W - x;
+  for (let k = 0; k < ((o.rotate / 90) | 0); k++) {
+    [x, y] = [H - y, x];                  // one quarter turn clockwise
+    [W, H] = [H, W];
+  }
+  return [x, y];
+}
+function orientInv(x, y, o, W, H) {       // oriented -> native image; W,H oriented
+  for (let k = 0; k < ((o.rotate / 90) | 0); k++) {
+    [x, y] = [y, W - x];                  // undo one clockwise quarter turn
+    [W, H] = [H, W];
+  }
+  if (o.mirror) x = W - x;
+  return [x, y];
+}
 function sensorToDisplay(sx, sy) {
   const rect = contentRect();
   const [Rx, Ry] = R.roi, [bx, by] = R.binning, [Iw, Ih] = R.imageSize;
-  return { u: (sx - Rx) / bx * (rect.w / Iw), v: (sy - Ry) / by * (rect.h / Ih) };
+  const [Dw, Dh] = R.displaySize;
+  const [ox, oy] = orientFwd((sx - Rx) / bx, (sy - Ry) / by, R.orient, Iw, Ih);
+  return { u: ox * rect.w / Dw, v: oy * rect.h / Dh };
 }
 function displayToSensor(u, v) {
   const rect = contentRect();
-  const [Rx, Ry] = R.roi, [bx, by] = R.binning, [Iw, Ih] = R.imageSize;
-  return { x: Rx + (u * Iw / rect.w) * bx, y: Ry + (v * Ih / rect.h) * by };
+  const [Rx, Ry] = R.roi, [bx, by] = R.binning, [Dw, Dh] = R.displaySize;
+  const [nx, ny] = orientInv(u * Dw / rect.w, v * Dh / rect.h, R.orient, Dw, Dh);
+  return { x: Rx + nx * bx, y: Ry + ny * by };
 }
-function mappable() { return !!(R.roi && R.imageSize && R.binning); }
+function mappable() { return !!(R.roi && R.imageSize && R.displaySize && R.binning); }
 
 // ---------------------------------------------------------------- ROI ops --
 // Every successful change adopts the server echo; pushes previous ROI (if the
@@ -244,9 +282,13 @@ $("streambox").addEventListener("contextmenu", async ev => {
 // -> displayed box). Keep both sides in sync if the mapping ever changes.
 const liveTransform = {
   ready: () => mappable(),
-  imageSize: () => R.imageSize,
+  imageSize: () => R.displaySize,
   toDisplay: (x, y) => sensorToDisplay(x, y),
   toNative: (u, v) => displayToSensor(u, v),
+  // After a quarter turn the screen's x axis runs along sensor y, so a
+  // rectangle's on-screen width is its stored height. The layer asks, so it can
+  // label "w × h" the way the operator sees it.
+  swapsAxes: () => !!R.orient && (R.orient.rotate === 90 || R.orient.rotate === 270),
 };
 
 function renderMeasures() {
@@ -275,7 +317,7 @@ function setTool(t) {
 // the dock's own ROI tool.
 const img = $("stream"), box = $("dragbox"), sbox = $("streambox"), svg = $("overlay");
 img.addEventListener("dragstart", ev => ev.preventDefault());
-let drag = null;            // ROI drag: {x0, y0, snap:{rect, Iw, Ih, roi, bin, rev}}
+let drag = null;            // ROI drag: {x0, y0, snap:{rect, Dw, Dh, roi, bin, orient, rev}}
 
 function contentRect() {
   // Displayed content area EXCLUDING the css border (mapping spec).
@@ -286,15 +328,16 @@ function contentRect() {
 }
 
 sbox.addEventListener("pointerdown", ev => {
-  if (ev.button !== 0 || tool !== "roi" || !R.hasRoi || !R.roi || !R.imageSize) return;
-  const [Iw, Ih] = R.imageSize;
-  // Staleness gate: the <img> must actually be showing current-geometry frames.
-  if (img.naturalWidth !== Iw || img.naturalHeight !== Ih) {
+  if (ev.button !== 0 || tool !== "roi" || !R.hasRoi || !mappable()) return;
+  const [Dw, Dh] = R.displaySize;
+  // Staleness gate: the <img> must actually be showing current-geometry frames
+  // — judged against the ORIENTED size, since that is what the stream sends.
+  if (img.naturalWidth !== Dw || img.naturalHeight !== Dh) {
     toast("stream still updating — try again"); return;
   }
   drag = { x0: ev.clientX, y0: ev.clientY,
-           snap: { rect: contentRect(), Iw, Ih, roi: [...R.roi],
-                   bin: [...R.binning], rev: capsRev } };
+           snap: { rect: contentRect(), Dw, Dh, roi: [...R.roi],
+                   bin: [...R.binning], orient: { ...R.orient }, rev: capsRev } };
   try { sbox.setPointerCapture(ev.pointerId); } catch (e) { }
   ev.preventDefault();
 });
@@ -316,28 +359,79 @@ sbox.addEventListener("pointerup", ev => {
   if (!drag) return;
   box.style.display = "none";
   const d = drag; drag = null;
-  const { rect, Iw, Ih, roi, bin, rev } = d.snap;
+  const { rect, Dw, Dh, roi, bin, orient, rev } = d.snap;
   // Cancel if mapping inputs changed mid-drag (geometry moved under us).
   if (rev !== capsRev) return;
   const x1 = Math.min(Math.max(ev.clientX, rect.left), rect.left + rect.w);
   const y1 = Math.min(Math.max(ev.clientY, rect.top), rect.top + rect.h);
   if (Math.abs(x1 - d.x0) < 8 || Math.abs(y1 - d.y0) < 8) return;  // accidental click
 
-  // display px -> image px (floor/ceil corners, inclusive), spec transform
+  // display px -> ORIENTED image px (floor/ceil corners, inclusive), spec transform
   const u0 = Math.min(d.x0, x1) - rect.left, u1 = Math.max(d.x0, x1) - rect.left;
   const v0 = Math.min(d.y0, y1) - rect.top, v1 = Math.max(d.y0, y1) - rect.top;
   const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
-  const ix0 = clamp(Math.floor(u0 * Iw / rect.w), 0, Iw - 1);
-  const ix1 = clamp(Math.ceil(u1 * Iw / rect.w) - 1, ix0, Iw - 1);
-  const iy0 = clamp(Math.floor(v0 * Ih / rect.h), 0, Ih - 1);
-  const iy1 = clamp(Math.ceil(v1 * Ih / rect.h) - 1, iy0, Ih - 1);
-  // image px -> full-sensor px (offset by current ROI, scale by binning)
+  const ox0 = clamp(Math.floor(u0 * Dw / rect.w), 0, Dw - 1);
+  const ox1 = clamp(Math.ceil(u1 * Dw / rect.w) - 1, ox0, Dw - 1);
+  const oy0 = clamp(Math.floor(v0 * Dh / rect.h), 0, Dh - 1);
+  const oy1 = clamp(Math.ceil(v1 * Dh / rect.h) - 1, oy0, Dh - 1);
+  // oriented -> NATIVE image px: send the box's outer pixel EDGES through the
+  // inverse orientation. Integer edges stay integer, and a quarter turn or a
+  // mirror sends a box to a box, so min/max recovers it exactly.
+  const [ex0, ey0] = orientInv(ox0, oy0, orient, Dw, Dh);
+  const [ex1, ey1] = orientInv(ox1 + 1, oy1 + 1, orient, Dw, Dh);
+  const ix0 = Math.min(ex0, ex1), ix1 = Math.max(ex0, ex1) - 1;
+  const iy0 = Math.min(ey0, ey1), iy1 = Math.max(ey0, ey1) - 1;
+  // native image px -> full-sensor px (offset by current ROI, scale by binning)
   const x = roi[0] + ix0 * bin[0];
   const y = roi[1] + iy0 * bin[1];
   const w = (ix1 - ix0 + 1) * bin[0];
   const h = (iy1 - iy0 + 1) * bin[1];
   applyRoi(`/roi?x=${x}&y=${y}&w=${w}&h=${h}`);
 });
+
+// ----------------------------------------------------------- orientation --
+// Rotate / mirror happens server-side to every frame, so recordings, stills and
+// snapshots come out the way the stream looks. The buttons act on the picture
+// AS DISPLAYED; the server composes each onto the saved orientation.
+function paintOrientation() {
+  const o = R.orient || {};
+  $("orient-label").textContent = o.label || "";
+  // Mirrors the server's 409: the recorder latches the frame shape, and one
+  // timelapse folder must not mix orientations.
+  const busy = recState !== "idle" || tlOn;
+  for (const id of ["orient-ccw", "orient-cw", "orient-fh", "orient-fv", "orient-reset"])
+    $(id).disabled = busy;
+  $("orient-reset").style.visibility = (o.rotate || o.mirror) ? "" : "hidden";
+  $("orient-row").title = busy ? "stop recording / the timelapse to change the orientation" : "";
+}
+async function orient(op) {
+  const { ok, status, j } = await post(`/orientation?op=${op}`);
+  if (!ok) { toast(`orientation: ${j.detail || status}`); return; }
+  cancelDebounces();
+  if (j.capabilities) adoptCaps(j.capabilities);   // re-maps annotations too
+  else {
+    // Disconnected: the server saved the orientation but has no geometry to
+    // report, so the size held here is now the wrong shape. Drop it — mapping
+    // stays off (mappable() is false) until pollInfo sees frames of a known size
+    // again and refetches capabilities. Bumping the revision cancels any drag.
+    const quarterBefore = !!R.orient && R.orient.rotate % 180 === 90;
+    R.orient = j.orientation;
+    R.displaySize = null;
+    capsRev += 1;
+    if (M) {
+      M.epoch = capsRev;
+      redraw();
+      if (quarterBefore !== (R.orient.rotate % 180 === 90)) renderMeasures();
+    }
+    paintOrientation();
+  }
+  resetStream();            // the frame changed shape: reconnect, fresh epoch
+}
+$("orient-ccw").onclick = () => orient("ccw");
+$("orient-cw").onclick = () => orient("cw");
+$("orient-fh").onclick = () => orient("flip_h");
+$("orient-fv").onclick = () => orient("flip_v");
+$("orient-reset").onclick = () => orient("reset");
 
 // ----------------------------------------------------------- calibration --
 const num = MeasureLayer.num;
@@ -437,6 +531,7 @@ function setRecUI(state) {
                   state === "encoding" ? "encoding…" : "● record";
   b.classList.toggle("on", state === "recording");
   b.disabled = state === "encoding";
+  paintOrientation();
 }
 $("rec").onclick = async () => {
   if (recState === "idle") {
@@ -484,6 +579,7 @@ function setTl(on) {
   tlOn = on;
   $("tl-btn").innerHTML = on ? "&#9632; stop timelapse" : "&#9654; start timelapse";
   $("tl-btn").style.background = on ? "#a33" : "";
+  paintOrientation();
 }
 function tlLine(j) {
   let t = `${j.taken} stills`;
@@ -578,9 +674,20 @@ async function pollInfo() {
       $("conn").textContent = "disconnect";
       document.title = `${NAME} · ${j.model}`;
       $("title").textContent = j.model || NAME;
-      // Multi-client reconciliation: another tab may have changed the ROI.
-      if (j.roi && R.roi && !roisEqual(j.roi, R.roi)) {
-        zoomStack.length = 0;
+      // Multi-client reconciliation: another tab (or the DAQ panel, or a
+      // popped-out window) may have changed the ROI or the orientation.
+      const roiMoved = j.roi && R.roi && !roisEqual(j.roi, R.roi);
+      const o = j.orientation, ro = R.orient || {};
+      const reoriented = !!o && (o.rotate !== ro.rotate || !!o.mirror !== !!ro.mirror);
+      // The delivered frame size is the last word. It catches an orientation
+      // changed while disconnected (no capabilities came back then), a page that
+      // booted before the camera was up, and a binning change from another tab.
+      // Only when the server actually reports a size — otherwise a camera whose
+      // size cannot be read would refetch and reconnect the stream every second.
+      const resized = !!j.width &&
+        (!R.displaySize || j.width !== R.displaySize[0] || j.height !== R.displaySize[1]);
+      if (roiMoved || reoriented || resized) {
+        if (roiMoved) zoomStack.length = 0;   // sensor ROIs survive a re-orientation
         cancelDebounces();
         await loadCaps();
         resetStream();

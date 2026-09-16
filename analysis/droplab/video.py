@@ -66,16 +66,38 @@ def sidecar_binning(meta: Optional[dict]) -> tuple[float, float]:
     return bx, by
 
 
+def sidecar_image_binning(meta: Optional[dict]) -> tuple[float, float]:
+    """(horizontal, vertical) binning of the RECORDED image's own axes.
+
+    ``binning`` in the sidecar is (bx, by) in SENSOR axes. The dock orients
+    frames after binning (camera_dock/orientation.py), and a quarter turn puts
+    sensor y along the image's horizontal axis — so the factors swap. A mirror or
+    a half turn keeps the axes. Sidecars from before orientation existed carry no
+    ``orientation`` and read as upright.
+    """
+    bx, by = sidecar_binning(meta)
+    o = (meta or {}).get("orientation")
+    try:
+        rotate = int(o.get("rotate", 0)) % 360 if isinstance(o, dict) else 0
+    except (TypeError, ValueError):
+        rotate = 0
+    return (by, bx) if rotate in (90, 270) else (bx, by)
+
+
 def sidecar_pixels_per_um(meta: Optional[dict]) -> Optional[float]:
     """Image pixels per micrometre (**horizontal**), from the dock's sidecar.
 
     The dock stores ``um_per_px`` as micrometres per *sensor* pixel, deliberately,
     so the number survives binning and ROI changes. droplab (and the upstream
-    count-droplets scripts) measure in *image* pixels, and binning maps bx sensor
-    pixels onto one image pixel horizontally::
+    count-droplets scripts) measure in *image* pixels, and binning maps ``b_h``
+    sensor pixels onto one image pixel horizontally::
 
-        um per image px = um_per_px * bx
-        pixels_per_um   = 1 / (um_per_px * bx)
+        um per image px = um_per_px * b_h
+        pixels_per_um   = 1 / (um_per_px * b_h)
+
+    ``b_h`` is the binning along the IMAGE's horizontal axis
+    (``sidecar_image_binning``): bx for an upright recording, by after the dock
+    turned the camera a quarter turn.
 
     ROI is a crop, not a rescale, so it does not enter the conversion.
 
@@ -98,8 +120,8 @@ def sidecar_pixels_per_um(meta: Optional[dict]) -> Optional[float]:
         return None
     if um_per_px <= 0:
         return None
-    bx, _ = sidecar_binning(meta)
-    scale = um_per_px * bx
+    b_h, _ = sidecar_image_binning(meta)
+    scale = um_per_px * b_h
     return (1.0 / scale) if scale > 0 else None
 
 
@@ -348,6 +370,7 @@ def probe(path: str) -> dict:
             "calibration": (meta or {}).get("calibration"),
             "um_per_px": (meta or {}).get("um_per_px"),
             "binning": (meta or {}).get("binning"),
+            "image_binning": list(sidecar_image_binning(meta)),   # [horizontal, vertical]
             # pixels_per_um is the horizontal scale and is applied isotropically
             # downstream — so it is only valid in y when the axes bin equally.
             "anisotropic_binning": sidecar_binning(meta)[0] != sidecar_binning(meta)[1],

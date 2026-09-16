@@ -243,8 +243,14 @@
     describe(a) {
       const dx = a.x1 - a.x0, dy = a.y1 - a.y0;
       if (a.type === "line") return { short: this.fmtLen(Math.hypot(dx, dy)) };
-      if (a.type === "rect")
-        return { short: this.fmtPair(Math.abs(dx), Math.abs(dy)) };
+      if (a.type === "rect") {
+        // NOTE[live->offline]: a host whose display is turned a quarter turn
+        // from its native pixels (the live dock with a rotated camera) adds
+        // transform.swapsAxes() so "w × h" reads as SEEN, not as stored.
+        // Optional: the default transform omits it, and a file displays as stored.
+        const swap = !!(this.transform.swapsAxes && this.transform.swapsAxes());
+        return { short: this.fmtPair(Math.abs(swap ? dy : dx), Math.abs(swap ? dx : dy)) };
+      }
       const r = Math.hypot(dx, dy);
       return { short: `⌀ ${this.fmtLen(2 * r)}`, extra: `r ${this.fmtLen(r)}` };
     }

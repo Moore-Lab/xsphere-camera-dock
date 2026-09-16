@@ -216,7 +216,11 @@ $("sidecar").onchange = e => {
         // for free because cam.js's liveTransform already works in sensor px.
         // ROI is a crop, not a rescale, so it does not enter.
         // Same conversion as droplab's video.sidecar_pixels_per_um (reciprocal).
-        const b = Array.isArray(j.binning) ? Number(j.binning[0]) : 1;
+        // The dock orients frames AFTER binning: a quarter turn puts sensor y
+        // along this image's horizontal axis, so take that factor instead.
+        const quarter = !!j.orientation && Number(j.orientation.rotate) % 180 === 90;
+        const axis = quarter && Array.isArray(j.binning) && j.binning.length > 1 ? 1 : 0;
+        const b = Array.isArray(j.binning) ? Number(j.binning[axis]) : 1;
         const bx = (isFinite(b) && b > 0) ? b : 1;
         setScale(raw * bx, j.calibration || "sidecar");
         $("cal-stat").textContent =

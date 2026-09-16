@@ -230,6 +230,32 @@ New/changed:
   applied == current. On error (409 toast) stack and fields stay untouched. The 1 s status poll
   carries the current ROI — if it differs from the client's last echo (another tab changed it),
   the stack resets and fields redraw.
+- **Orientation (rotate 90° steps / mirror), 2026-09.** The TSI SDK has no readout flip, so it
+  is software, applied to **every frame in `AcquisitionEngine` right after the grab** — the
+  latest slot and the sink only ever see oriented frames, so stream, recording, timelapse and
+  snapshots cannot disagree (`camera_dock/orientation.py`; ~0.6–0.9 ms per full Zelux frame).
+  Model: `(rotate cw ∈ {0,90,180,270}, mirror)`, mirror left-right FIRST then rotate; UI buttons
+  compose in display space. Persisted per camera in `orientations/<camera>.json` (gitignored rig
+  state, like `calibrations/`), loaded in `CameraSession.__init__`. **The sensor does not
+  rotate:** ROI, binning, presets and annotations stay in sensor pixels. This amends the
+  drag-ROI transform above: `capabilities.image_size` stays the NATIVE grid `(Iw,Ih)`;
+  `display_size` `(Dw,Dh)` is the oriented frame, and the staleness gate compares
+  `naturalWidth` against **it**. Box corners are floored/ceiled in oriented pixels, their outer
+  edges sent through the inverse orientation (`orientInv` in cam.js — edges stay integer and a
+  box maps to a box), then offset/scaled by ROI and binning as before; the measure-layer bridge
+  (`sensorToDisplay`/`displayToSensor`) goes through the same pair. `expected_shape` and
+  `/info` width/height are oriented — comparing against the native size would reject every
+  frame as stale and black out the stream. `POST /orientation` is refused (409) while
+  recording/encoding/timelapsing, exactly like a region change (the recorder latches the frame
+  shape; one timelapse folder must not mix orientations), and allowed while disconnected. Video
+  sidecars carry `orientation` beside the sensor-coordinate `roi`/`binning`.
+  The engine re-checks the orientation generation at the **sink** as well as the latest slot —
+  a recorder latches its first frame's shape, so one stale frame would cost the take. The page
+  treats `/info` width/height (the delivered frame) as the last word and refetches capabilities
+  on any mismatch, which covers a re-orientation made while disconnected. Sidecar scale readers
+  (droplab `video.sidecar_image_binning`, measure.html) take the binning of the recording's own
+  horizontal axis: by, not bx, after a quarter turn.
+  `tests/test_orientation.py` mirrors the two JS maps and pins them against the numpy transform.
 - **Recording state machine**: `rec_state ∈ {idle, recording, encoding}`, all transitions under
   the session lock. `record_start` (409 unless idle): makedirs + `%f`-timestamped path first,
   create recorder, assign state, `set_sink` **last** (cleanup on any failure). `record_stop`

@@ -35,3 +35,4 @@ Thumbs.db
 # Claude Code local tooling
 .claude/
 calibrations/
+orientations/

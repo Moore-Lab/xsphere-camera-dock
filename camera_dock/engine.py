@@ -19,6 +19,11 @@ Concurrency contracts (docs/DESIGN.md §2.3):
 * The sink is invoked under a dedicated ``_sink_lock`` and ``set_sink`` takes the
   same lock, so ``set_sink(None)`` returning is a barrier: no ``submit`` is in
   flight afterwards and none will start.
+* Frames are ORIENTED here, right after the grab (see orientation.py), so the
+  latest slot and the sink only ever see oriented frames — stream, recording,
+  timelapse and snapshots cannot disagree. ``set_orientation`` clears the latest
+  slot and bumps a generation; a frame transformed under the previous
+  orientation is dropped rather than published.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from time import perf_counter, sleep
 from typing import Callable, Optional, Tuple
 
 from .base import Frame
+from .orientation import Orientation
 
 # A sink receives (frame, frame_index, t_sw). It runs on the acquisition thread
 # and must be cheap (append/enqueue) — it must never block.
@@ -37,8 +43,10 @@ Sink = Callable[[Frame, int, float], None]
 class AcquisitionEngine:
     """Runs a driver's acquisition on a background thread."""
 
-    def __init__(self, camera) -> None:
+    def __init__(self, camera, orientation: Optional[Orientation] = None) -> None:
         self._cam = camera
+        self._orientation = orientation or Orientation()
+        self._orient_gen = 0           # bumped by set_orientation
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._lock = threading.Lock()
@@ -97,8 +105,17 @@ class AcquisitionEngine:
                 sleep(0.05)   # a fast-failing camera must not busy-spin
                 continue
 
+            # Orient outside the frame lock (a quarter turn of a full Zelux frame
+            # is ~1 ms), then publish only if nobody re-oriented meanwhile.
+            with self._lock:
+                orient, gen = self._orientation, self._orient_gen
+            if not orient.is_identity:
+                frame = Frame(orient.apply(frame.data), frame.meta)
+
             t = frame.meta.t_sw
             with self._lock:
+                if gen != self._orient_gen:
+                    continue           # transformed under the old orientation
                 self._latest = frame
                 self._frame_index += 1
                 index = self._frame_index
@@ -106,7 +123,13 @@ class AcquisitionEngine:
             # Sink outside the frame lock but under the sink lock — set_sink(None)
             # is then a barrier (no submit in flight after it returns).
             with self._sink_lock:
-                if self._sink is not None:
+                # Re-check the orientation generation here too: set_orientation
+                # can land between publishing above and this point, and a
+                # recorder attached right after it would latch this stale shape
+                # and then silently drop every correctly oriented frame. (An
+                # unlocked int read is enough: the bump happens-before any
+                # record_start that follows the re-orientation.)
+                if self._sink is not None and gen == self._orient_gen:
                     self._sink(frame, index, t)
 
             window_n += 1
@@ -139,3 +162,16 @@ class AcquisitionEngine:
         """Attach (or clear with None) the per-frame sink. Clearing is a barrier."""
         with self._sink_lock:
             self._sink = sink
+
+    @property
+    def orientation(self) -> Orientation:
+        return self._orientation
+
+    def set_orientation(self, orientation: Orientation) -> None:
+        """Orient subsequent frames. Clears the latest slot so a frame from the
+        previous orientation is never served. Callers must not change it while a
+        recording sink is attached — the recorder latches the frame shape."""
+        with self._lock:
+            self._orientation = orientation
+            self._orient_gen += 1
+            self._latest = None
