@@ -1,0 +1,3 @@
+# Hayear HY-1136 is a UVC camera driven via OpenCV — no vendor SDK needed.
+numpy
+opencv-python
