@@ -1,7 +1,8 @@
 """Camera settings presets — capture / apply / save / load, camera-agnostic.
 
 Lets the dock reproduce a camera setup across restarts: capture the current
-exposure / gain / frame rate / ROI / binning, save it to a JSON file, and apply it
+exposure / gain / frame rate / ROI / binning, plus any driver-specific funnel
+controls (pixel clock, black level, ...), save it to a JSON file, and apply it
 later. Built only on the :class:`~camera_dock.base.CameraBase` surface, so it works
 for any camera and is reused by the web app (and the DAQ).
 
@@ -17,6 +18,10 @@ import os
 from typing import List
 
 from .paths import data_dir
+
+# Funnel controls with their own top-level preset keys (stable JSON, read by the
+# DAQ); every other writable control goes under "controls".
+_TOP_LEVEL = ("exposure", "gain", "fps")
 
 
 def capture(camera, *, has_roi: bool) -> dict:
@@ -35,6 +40,17 @@ def capture(camera, *, has_roi: bool) -> dict:
         s["binning"] = list(camera.get_binning())
     except Exception:
         pass
+    controls = {}
+    try:
+        caps = camera.capabilities()
+    except Exception:
+        caps = {}
+    for name, entry in caps.items():
+        if name in _TOP_LEVEL or entry.get("read_only") or entry.get("value") is None:
+            continue
+        controls[name] = float(entry["value"])
+    if controls:                 # cameras without extras keep the old JSON shape
+        s["controls"] = controls
     return s
 
 
@@ -42,10 +58,17 @@ def apply(camera, settings: dict, *, set_roi: bool = True) -> None:
     """Apply a settings dict to ``camera`` (best-effort; unsupported keys ignored).
 
     ``set_roi=False`` skips the ROI (the caller may need to stop acquisition first;
-    see the web app's region-change path). Binning is applied before ROI. Frame
-    rate is applied before exposure: on cameras whose exposure range depends on
-    the frame period (IDS uEye), the reverse order clamps long exposures.
+    see the web app's region-change path). Driver-specific ``controls`` go first:
+    a pixel clock re-ranges fps and exposure, so setting it afterwards would clamp
+    them. Binning is applied before ROI. Frame rate is applied before exposure: on
+    cameras whose exposure range depends on the frame period (IDS uEye), the
+    reverse order clamps long exposures.
     """
+    for name, value in (settings.get("controls") or {}).items():
+        try:
+            camera.set(name, float(value))    # funnel: unsupported -> ok=False
+        except Exception:
+            pass
     if "fps" in settings:
         try:
             camera.set_frame_rate(float(settings["fps"]))

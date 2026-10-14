@@ -215,7 +215,8 @@ ThorCam's `uc480_64.dll` with no IDS suite installed. Findings that are load-bea
   ceiling and re-ranges fps and exposure; a set re-applies the intent and returns both as side
   effects. This USB 2 link tops out near 21 MB/s: at full frame 30 MHz delivers 16 of 17.5 fps,
   35 MHz 13.9 of 20.4, 43 MHz **nothing** (live or after re-arm, until the clock is lowered). Sets
-  above the default carry a warning. The clock is not saved in presets.
+  above the default carry a warning. Presets save the clock under `controls` and set it before
+  fps and exposure (§4).
 - **Locks.** `_lock` (RLock) wraps every SDK sequence; `_wait_lock` is held by `grab()` across
   one ≤100 ms event wait and by anything that destroys the event (stop, AOI change, disconnect),
   because closing a handle under a pending wait is undefined. Order `_wait_lock → _lock`; setters
@@ -229,7 +230,11 @@ ThorCam's `uc480_64.dll` with no IDS suite installed. Findings that are load-bea
 Carried forward: session model, MJPEG generator (asyncio pacing, JPEG off the event loop),
 timelapse (drift-free schedule, stale guard via monotonic engine index, **UI state restore on page
 load** incl. the already-running and server-restarted paths), presets (auto-`default` at connect,
-before the engine starts so ROI applies without a region cycle), runtime connect/disconnect (409
+before the engine starts so ROI applies without a region cycle; the top-level `exposure`/`gain`/
+`fps`/`roi`/`binning` keys are unchanged, and every other writable funnel control, e.g.
+`pixel_clock` (IDS) or `black_level` (Zelux), is saved under `controls` and applied FIRST, since a
+pixel clock re-ranges fps and exposure; then fps before exposure, binning before ROI. A preset
+without `controls`, or naming one the camera lacks, applies as before), runtime connect/disconnect (409
 while recording/timelapsing; page reload re-establishes stream+controls), per-camera failure
 isolation, auto-exposure.
 
