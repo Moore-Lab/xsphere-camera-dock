@@ -184,6 +184,46 @@ Lifecycle: `connect()` / `disconnect()` / `is_connected` / `device_info` / `bit_
   correction, LED. Trigger modes deferred (SW-triggered pinned). All scalar controls on the Zelux
   are live-settable while armed — no disarm-wrapper machinery.
 
+## 3b. IDS uEye / Thorlabs DCx driver specifics (`drivers/ids.py`), 2026-10
+
+Tokens `ids` and `dcc` (same driver; `ids:SERIAL` selects a unit, and an unqualified open with
+several uEye cameras attached is refused). Ported from `ids-ueye/ids_ueye/camera.py`, keeping its
+hardware-tested capture core (12-buffer freerun ring, frame event, pitch-stripped Mono8, AOI
+free→set→realloc). Measured on a C1285R12M (DCC1545M class, 1280×1024 mono, USB 2) through
+ThorCam's `uc480_64.dll` with no IDS suite installed. Findings that are load-bearing:
+
+- **uc480 binding.** pyueye hardcodes the IDS DLL name; `_import_ueye` re-binds it to uc480. The
+  uc480 DLL lacks `is_WaitEvent`, so frames wait on an app-owned Windows event (`is_InitEvent`).
+- **Per-frame metadata needs the uc480 struct size.** `is_GetImageInfo` must get the *memory ID*
+  of the buffer (looked up from `pcMemLast`'s address) and `nImageInfoSize = 80` (uc480.h's
+  `UC480IMAGEINFO`); pyueye's 96-byte `UEYEIMAGEINFO` is rejected with 125. The legacy driver got
+  both wrong, so its metadata was always `None`. Now every frame has `hw_count` (consecutive) and
+  a 100 ns device timestamp, so sidecars carry genuine hw-clock fps and drops.
+- **Read fps back from hardware** (`IS_GET_FRAMERATE`). The legacy getter echoed the request, so
+  30 fps "succeeded" at 13.96.
+- **Exposure ceiling = current frame period** (unlike TSI). The advertised range runs to the
+  longest frame period (slowest fps), and the driver implements §2.1 explicitly: setting fps
+  shortens an exposure that no longer fits (warning + side effect, commanded exposure updated so
+  a re-arm does not undo it); setting a long exposure lowers fps to fit (warning + side effect).
+  The operator's fps request is kept separately and re-applied after capture start, AOI change
+  and pixel-clock change, so shortening the exposure or shrinking the ROI brings the rate back.
+  `_apply_defaults` therefore requests 30 fps outright rather than `min(30, fh)`: the funnel
+  clamps, and the remembered 30 is reached once an ROI raises the ceiling (296×200 → 30 fps;
+  ceiling 156). Note the slowest frame rate also rises as the AOI shrinks, so long exposures
+  need a large ROI or a lower pixel clock (300×200 at 24 MHz: max 58 ms).
+- **Pixel clock** is the funnel control `pixel_clock` (MHz, 5–43, default 24). It sets the fps
+  ceiling and re-ranges fps and exposure; a set re-applies the intent and returns both as side
+  effects. This USB 2 link tops out near 21 MB/s: at full frame 30 MHz delivers 16 of 17.5 fps,
+  35 MHz 13.9 of 20.4, 43 MHz **nothing** (live or after re-arm, until the clock is lowered). Sets
+  above the default carry a warning. The clock is not saved in presets.
+- **Locks.** `_lock` (RLock) wraps every SDK sequence; `_wait_lock` is held by `grab()` across
+  one ≤100 ms event wait and by anything that destroys the event (stop, AOI change, disconnect),
+  because closing a handle under a pending wait is undefined. Order `_wait_lock → _lock`; setters
+  never take `_wait_lock` (0.24 ms per set while streaming). `stop()` signals the event first, so a
+  waiting grab returns in ~1 ms. `_UEYE_LOCK` serializes enumerate/init/exit process-wide.
+- Master gain (index 0–100 → 1.0–13.0×, 0–22.3 dB, from `is_SetHWGainFactor`) when the sensor
+  reports `bMasterGain`. No binning. Mono8 only (the reference's tested mode).
+
 ## 4. Eval web server (`webapp.py`)
 
 Carried forward: session model, MJPEG generator (asyncio pacing, JPEG off the event loop),

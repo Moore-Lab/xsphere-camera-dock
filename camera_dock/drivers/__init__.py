@@ -1,6 +1,7 @@
 """Camera driver registry — token -> driver instance, contractually never-raise.
 
-``make_camera("zelux")`` or ``make_camera("zelux:12345")`` (serial selection).
+``make_camera("zelux")`` or ``make_camera("zelux:12345")`` (serial selection);
+``ids``/``dcc`` (IDS uEye, Thorlabs DCC/DCx) take a serial the same way.
 Any failure — unknown token, paused module, missing SDK, constructor error —
 returns an :class:`~camera_dock.base.UnavailableCamera` stub instead of raising:
 the parent DAQ panel constructs sessions before its server starts, and one bad
@@ -17,11 +18,13 @@ from ..base import CameraDriver, UnavailableCamera
 # token -> (module name under camera_dock.drivers, class name)
 _REGISTRY = {
     "zelux": ("zelux", "ZeluxCamera"),
+    "ids": ("ids", "IDSCamera"),     # IDS uEye, incl. Thorlabs DCC/DCx (uc480)
+    "dcc": ("ids", "IDSCamera"),     # same driver, named for the Thorlabs DCC
     "sim": ("sim", "SimCamera"),     # hardware-free test fixture
 }
 
 # Tokens the old dock knew; development on them is paused during the rebuild.
-_PAUSED = {"basler", "hayear", "ids", "dcc"}
+_PAUSED = {"basler", "hayear"}
 
 
 def make_camera(token: str) -> CameraDriver:

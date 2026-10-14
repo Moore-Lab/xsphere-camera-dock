@@ -13,6 +13,29 @@ See the [README](../README.md) for this repo's roadmap.
 
 ---
 
+## 2026-10-14 — IDS uEye / Thorlabs DCx camera joins the dock (`ids`, `dcc`)
+
+**Context.** An older Thorlabs DCx camera (C1285R12M, s/n 4103060588; IDS uEye hardware behind
+ThorCam's `uc480_64.dll`) was connected. `ids`/`dcc` had been paused stubs since the rebuild.
+
+- **New `camera_dock/drivers/ids.py`** on the `CameraDriver` ABC, ported from the legacy
+  `ids-ueye` module; registered as `ids` and `dcc`, removed from `_PAUSED`. Controls: exposure,
+  fps, gain (master gain), pixel_clock. ROI yes, binning no. Details in DESIGN §3b.
+- **Legacy bugs fixed in the port:** per-frame metadata never worked (wrong buffer ID, and
+  pyueye's struct is too big for uc480) and now delivers frame counter and device timestamp; fps
+  getter returned the request instead of the hardware rate; `sensor_size` returned the AOI.
+- **fps/exposure coupling** per §2.1: long exposure lowers fps, raising fps shortens exposure,
+  and the operator's fps request survives re-arms. `webapp._apply_defaults` now asks for 30 fps
+  outright (the funnel clamps; identical for Zelux/sim).
+- **Bandwidth limit found:** 43 MHz pixel clock at full frame delivers no frames on this USB 2
+  link; sets above the 24 MHz default warn.
+- **Verified on hardware** (scratch test, 30 checks; then `camera-dock-ids` preview on :8001):
+  14.0 fps full frame, 296×200 ROI → 30 fps, 150 ms exposure → 6.6 fps and back, live pixel
+  clock 24→30→24 without a stall, stop releases a waiting grab in 1 ms, 3 s recording 43/43
+  frames with consecutive hw counts and 13.954 fps hw-clock rate, unsupported control → 422.
+
+---
+
 ## 2026-09-15 — Camera orientation: rotate 90° at a time, mirror, applied to saved data
 
 **Context.** Cameras get mounted sideways or look through a mirror; the owner wants the picture

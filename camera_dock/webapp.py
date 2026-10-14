@@ -305,7 +305,10 @@ class CameraSession:
         try:
             _, fh = self.camera.frame_rate_range()
             if fh > 0:
-                self.camera.set_frame_rate(min(30.0, fh))
+                # Ask for 30 outright — the funnel clamps — so a driver that
+                # remembers the request (uEye) reaches it once a smaller ROI
+                # raises the ceiling, instead of remembering the full-frame max.
+                self.camera.set_frame_rate(30.0)
         except Exception:
             pass
         try:

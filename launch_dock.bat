@@ -3,7 +3,7 @@ REM ===================================================================
 REM  Launch the xsphere camera dock (standalone eval server).
 REM  Double-click this (or the "xSphere Camera Dock" desktop shortcut).
 REM  Edit the CAMERAS line to change which cameras the dock opens
-REM  (tokens: zelux, zelux:SERIAL, sim). Ctrl+C in this window to stop.
+REM  (tokens: zelux, zelux:SERIAL, ids, ids:SERIAL, sim). Ctrl+C to stop.
 REM ===================================================================
 title xsphere camera dock
 cd /d "%~dp0"
