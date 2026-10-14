@@ -19,6 +19,21 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton,
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QIntValidator
 
+# Make the Thorlabs native SDK DLLs discoverable before importing/using the SDK.
+# thorlabs_tsi_camera_sdk.dll (and its dependencies) ship with ThorCam. Both steps
+# are needed: os.add_dll_directory lets ctypes FIND the DLL (else FileNotFoundError),
+# and prepending PATH lets the DLL's own runtime dependencies load (else
+# tl_camera_open_sdk crashes with an access violation). Override the location with
+# the THORLABS_TSI_DLL_DIR env var if ThorCam is installed elsewhere.
+_THORLABS_DLL_DIR = os.environ.get(
+    "THORLABS_TSI_DLL_DIR", r"C:\Program Files\Thorlabs\Scientific Imaging\ThorCam")
+if os.path.isdir(_THORLABS_DLL_DIR):
+    try:
+        os.add_dll_directory(_THORLABS_DLL_DIR)
+    except (OSError, AttributeError):
+        pass
+    os.environ["PATH"] = _THORLABS_DLL_DIR + os.pathsep + os.environ.get("PATH", "")
+
 # Import Thorlabs SDK
 try:
     from thorlabs_tsi_sdk.tl_camera import TLCameraSDK, TLCamera
@@ -160,6 +175,22 @@ MARKUP_COLORS = {
 }
 
 # ── Pure helper functions (no SDK / Qt dependency; testable without hardware) ──
+
+def default_recordings_dir():
+    """Absolute path to the repo's recordings/ folder (created if missing).
+
+    This file lives in <repo>/reference/, so recordings/ is one directory up.
+    Best-effort: the makedirs failure is swallowed and the path returned anyway,
+    so the Save dialog still opens (just in a folder that may not yet exist).
+    Analyze recordings saved here with ``analysis/analyze_frames.py``.
+    """
+    d = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, "recordings"))
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        print(f"Could not create recordings dir {d}: {e}")
+    return d
+
 
 def clamp_roi(x, y, w, h, sensor_w, sensor_h, step_x=1, step_y=1,
               min_lrx=0, min_lry=0):
@@ -1903,10 +1934,19 @@ class ThorlabsCameraApp(QMainWindow):
             cam_instance.bit_depth     = cam_instance.camera.bit_depth
             cam_instance.sensor_width  = cam_instance.camera.sensor_width_pixels
             cam_instance.sensor_height = cam_instance.camera.sensor_height_pixels
-            # Active frame dimensions start at full sensor; updated by apply_roi/reset_roi
+            # Active frame dimensions: use the camera's ACTUAL image size, not the
+            # full sensor. Thorlabs reports image_width_pixels/image_height_pixels,
+            # which reflect any ROI already set on the device (e.g. left over from
+            # another app). Using sensor size here when the device is ROI-cropped
+            # makes every frame fail the width*height check in update_camera_frame
+            # and the display stays blank. Fall back to sensor for cameras that
+            # don't expose an image size (IDS starts at full AOI). Updated by
+            # apply_roi/reset_roi.
             cam_instance.roi = None
-            cam_instance.current_frame_w = cam_instance.sensor_width
-            cam_instance.current_frame_h = cam_instance.sensor_height
+            cam_instance.current_frame_w = (
+                getattr(cam_instance.camera, 'image_width_pixels', None) or cam_instance.sensor_width)
+            cam_instance.current_frame_h = (
+                getattr(cam_instance.camera, 'image_height_pixels', None) or cam_instance.sensor_height)
             # Pre-fill ROI width/height fields with full sensor size
             cam_instance.roi_w.setText(str(cam_instance.sensor_width))
             cam_instance.roi_h.setText(str(cam_instance.sensor_height))
@@ -2528,9 +2568,14 @@ class ThorlabsCameraApp(QMainWindow):
         if not cam_instance.recording:
             # Start recording
             try:
+                default_name = (f"{cam_instance.name.lower().replace(' ', '_')}_"
+                                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
+                # Default the dialog into the repo's recordings/ folder so every
+                # capture lands where analysis/analyze_frames.py looks by default.
+                default_path = os.path.join(default_recordings_dir(), default_name)
                 filename, _ = QFileDialog.getSaveFileName(
-                    self, f"Save Video - {cam_instance.name}", 
-                    f"{cam_instance.name.lower().replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
+                    self, f"Save Video - {cam_instance.name}",
+                    default_path,
                     "Video Files (*.mp4)"
                 )
                 if filename:
